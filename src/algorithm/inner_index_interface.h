@@ -1,0 +1,620 @@
+
+// Copyright 2024-present the vsag project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <atomic>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
+
+#include "container_types.h"
+#include "data_type.h"
+#include "datacell/attribute_inverted_interface.h"
+#include "datacell/extra_info_interface.h"
+#include "datacell/flatten_interface.h"
+#include "dataset_impl.h"
+#include "impl/heap/distance_heap.h"
+#include "inner_index_parameter.h"
+#include "json_types.h"
+#include "metric_type.h"
+#include "parameter.h"
+#include "storage/serialization.h"
+#include "storage/stream_reader.h"
+#include "storage/stream_writer.h"
+#include "type_helpers.h"
+#include "utils/function_exists_check.h"
+#include "utils/pointer_define.h"
+#include "vsag/dataset.h"
+#include "vsag/index.h"
+
+namespace vsag {
+
+DEFINE_POINTER2(InnerIndex, InnerIndexInterface);
+DEFINE_POINTER(LabelTable);
+DEFINE_POINTER(IndexFeatureList);
+DEFINE_POINTER(SafeThreadPool);
+
+class IndexCommonParam;
+
+class InnerIndexInterface {
+public:
+    InnerIndexInterface() = default;
+
+    explicit InnerIndexInterface(const InnerIndexParameterPtr& index_param,
+                                 const IndexCommonParam& common_param);
+
+    virtual ~InnerIndexInterface();
+
+    static constexpr char fast_string_delimiter = '|';
+
+    static InnerIndexPtr
+    FastCreateIndex(const std::string& index_fast_str, const IndexCommonParam& common_param);
+
+    virtual std::vector<int64_t>
+    Add(const DatasetPtr& base) = 0;
+
+    virtual std::string
+    AnalyzeIndexBySearch(const SearchRequest& request) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support analyze index by search");
+    }
+
+    virtual std::vector<int64_t>
+    Build(const DatasetPtr& base);
+
+    /**
+     * @brief Calculate distance by ID using DatasetPtr.
+     *
+        * Suitable for sparse vector indexes (SINDI) where vectors
+     * cannot be represented as a simple float pointer. The Dataset should
+     * contain sparse vectors via GetSparseVectors().
+     * For dense vector indexes, this overload is also available via default
+     * implementation that calls GetFloat32Vectors().
+     *
+     * Default implementation throws exception; indexes must override appropriately.
+     *
+     * @param vector DatasetPtr containing the query vector (sparse or dense format).
+     * @param id The unique identifier of the vector in the index.
+     * @param calculate_precise_distance If true, use high-precision vectors for computation.
+     * @return The distance between the query and the vector of the given ID.
+     * @throws VsagException If the index doesn't support calculate distance by id.
+     */
+    virtual float
+    CalcDistanceById(const DatasetPtr& vector,
+                     int64_t id,
+                     bool calculate_precise_distance = true) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support calculate distance by id");
+    };
+
+    /**
+     * @brief Calculate distance by ID using raw float pointer.
+     *
+     * Suitable for dense vector indexes (HGraph, BruteForce, IVF, DiskANN, HNSW).
+     * The query must be a contiguous float32 array with dimension matching the index.
+        * For sparse vector indexes (SINDI), this overload is not applicable.
+     *
+     * Default implementation throws exception; dense indexes must override.
+     *
+     * @param query Pointer to the float32 query vector (dense format).
+     * @param id The unique identifier of the vector in the index.
+     * @param calculate_precise_distance If true, use high-precision vectors for computation.
+     * @return The distance between the query and the vector of the given ID.
+     * @throws VsagException If the index doesn't support calculate distance by id.
+     */
+    virtual float
+    CalcDistanceById(const float* query, int64_t id, bool calculate_precise_distance = true) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support calculate distance by id");
+    }
+
+    /**
+     * @brief Calculate distances by IDs (batch) using raw float pointer.
+     *
+     * Suitable for dense vector indexes (HGraph, BruteForce, IVF, DiskANN, HNSW).
+     * The query must be a contiguous float32 array. For sparse vector indexes,
+     * this overload is not applicable.
+     *
+     * Default implementation loops through IDs calling CalcDistanceById.
+     * Dense indexes may override for batch optimization.
+     *
+     * @param query Pointer to the float32 query vector (dense format).
+     * @param ids Array of unique identifiers of vectors to be calculated.
+     * @param count Number of IDs in the array.
+     * @param calculate_precise_distance If true, use high-precision vectors for computation.
+     * @return DatasetPtr containing distances. '-1' indicates an invalid ID.
+     */
+    virtual DatasetPtr
+    CalDistanceById(const float* query,
+                    const int64_t* ids,
+                    int64_t count,
+                    bool calculate_precise_distance = true) const;
+
+    /**
+     * @brief Calculate distances by IDs (batch) using DatasetPtr.
+     *
+        * Suitable for sparse vector indexes (SINDI) where vectors
+     * cannot be represented as a simple float pointer. The Dataset should
+     * contain sparse vectors via GetSparseVectors().
+     * For dense vector indexes, this overload is also available via default
+     * implementation that calls GetFloat32Vectors().
+     *
+     * Default implementation loops through IDs calling CalcDistanceById.
+     * Sparse indexes must override for proper sparse vector handling.
+     *
+     * @param query DatasetPtr containing the query vector (sparse or dense format).
+     * @param ids Array of unique identifiers of vectors to be calculated.
+     * @param count Number of IDs in the array.
+     * @param calculate_precise_distance If true, use high-precision vectors for computation.
+     * @return DatasetPtr containing distances. '-1' indicates an invalid ID.
+     */
+    virtual DatasetPtr
+    CalDistanceById(const DatasetPtr& query,
+                    const int64_t* ids,
+                    int64_t count,
+                    bool calculate_precise_distance = true) const;
+
+    virtual uint64_t
+    CalSerializeSize() const;
+
+    [[nodiscard]] virtual bool
+    CheckFeature(IndexFeature feature) const;
+
+    [[nodiscard]] virtual bool
+    CheckIdExist(int64_t id) const;
+
+    virtual InnerIndexPtr
+    Clone(const IndexCommonParam& param);
+
+    virtual Index::Checkpoint
+    ContinueBuild(const DatasetPtr& base, const BinarySet& binary_set) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support ContinueBuild");
+    }
+
+    virtual bool
+    Tune(const std::string& parameters, bool disable_future_tuning) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION, "Index doesn't support Tune");
+    }
+
+    virtual void
+    Deserialize(const BinarySet& binary_set);
+
+    virtual void
+    Deserialize(const ReaderSet& reader_set);
+
+    virtual void
+    Deserialize(std::istream& in_stream);
+
+    virtual void
+    DeserializeStreaming(std::istream& in_stream);
+
+    virtual void
+    LoadStreamingBody(StreamReader& reader,
+                      const MetadataPtr& metadata,
+                      const LoadParameters& parameters);
+
+    virtual void
+    Deserialize(StreamReader& reader) = 0;
+
+    [[nodiscard]] virtual uint64_t
+    EstimateMemory(uint64_t num_elements) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support EstimateMemory");
+    }
+
+    virtual DatasetPtr
+    ExportIDs() const;
+
+    virtual InnerIndexPtr
+    ExportModel(const IndexCommonParam& param) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support ExportModel");
+    }
+
+    virtual uint32_t
+    Feedback(const DatasetPtr& query,
+             int64_t k,
+             const std::string& parameters,
+             int64_t global_optimum_tag_id = std::numeric_limits<int64_t>::max()) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support Feedback");
+    }
+
+    [[nodiscard]] virtual InnerIndexPtr
+    Fork(const IndexCommonParam& param) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION, "Index doesn't support Fork");
+    }
+
+    virtual void
+    GetAttributeSetByInnerId(InnerIdType inner_id, AttributeSet* attr) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetAttributeSetByInnerId");
+    }
+
+    virtual void
+    GetCodeByInnerId(InnerIdType inner_id, uint8_t* data) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetCodeByInnerId");
+    }
+
+    [[nodiscard]] virtual DatasetPtr
+    GetDataByIds(const int64_t* ids, int64_t count) const;
+
+    [[nodiscard]] virtual DatasetPtr
+    GetDataByIdsWithFlag(const int64_t* ids, int64_t count, uint64_t selected_data_flag) const;
+
+    virtual std::vector<IndexDetailInfo>
+    GetIndexDetailInfos() const;
+
+    virtual DetailDataPtr
+    GetDetailDataByName(const std::string& name, IndexDetailInfo& info) const;
+
+    [[nodiscard]] virtual uint64_t
+    EstimateBuildMemory(uint64_t num_elements) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support EstimateBuildMemory");
+    }
+
+    virtual void
+    GetExtraInfoByIds(const int64_t* ids, int64_t count, char* extra_infos) const;
+
+    [[nodiscard]] virtual IndexType
+    GetIndexType() const = 0;
+
+    [[nodiscard]] virtual uint64_t
+    GetMemoryUsage() const {
+        std::shared_lock lock(this->memory_usage_mutex_);
+        return this->current_memory_usage_.load();
+    }
+
+    [[nodiscard]] virtual std::unordered_map<std::string, uint64_t>
+    GetMemoryUsageDetail() const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetMemoryUsageDetail");
+    }
+
+    virtual std::pair<int64_t, int64_t>
+    GetMinAndMaxId() const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetMinAndMaxId");
+    }
+
+    [[nodiscard]] virtual std::string
+    GetName() const = 0;
+
+    [[nodiscard]] virtual int64_t
+    GetNumElements() const = 0;
+
+    [[nodiscard]] virtual int64_t
+    GetNumberRemoved() const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetNumberRemoved");
+    }
+
+    [[nodiscard]] virtual std::string
+    GetStats() const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetStats");
+    }
+
+    virtual void
+    GetVectorByInnerId(InnerIdType inner_id, float* data) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetVectorByInnerId");
+    }
+
+    virtual void
+    GetSparseVectorByInnerId(InnerIdType inner_id,
+                             SparseVector* data,
+                             Allocator* specified_allocator) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support GetSparseVectorByInnerId");
+    }
+
+    virtual DatasetPtr
+    GetVectorByIds(const int64_t* ids, int64_t count, Allocator* specified_allocator) const;
+
+    virtual void
+    InitFeatures() = 0;
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query,
+              int64_t k,
+              const std::string& parameters,
+              const FilterPtr& filter) const = 0;
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query,
+              int64_t k,
+              const std::string& parameters,
+              const BitsetPtr& invalid) const;
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query,
+              int64_t k,
+              const std::string& parameters,
+              const FilterPtr& filter,
+              Allocator* allocator) const {
+        throw std::runtime_error("Index doesn't support new filter");
+    };
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query,
+              int64_t k,
+              const std::string& parameters,
+              const FilterPtr& filter,
+              Allocator* allocator,
+              IteratorContext*& iter_ctx,
+              bool is_last_filter) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support new filter");
+    };
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query,
+              int64_t k,
+              const std::string& parameters,
+              const std::function<bool(int64_t)>& filter) const;
+
+    [[nodiscard]] virtual DatasetPtr
+    KnnSearch(const DatasetPtr& query, int64_t k, SearchParam& search_param) const {
+        throw std::runtime_error("Index doesn't support new filter");
+    }
+
+    virtual void
+    Merge(const std::vector<MergeUnit>& merge_units) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION, "Index doesn't support Merge");
+    }
+
+    virtual uint32_t
+    Pretrain(const std::vector<int64_t>& base_tag_ids, uint32_t k, const std::string& parameters) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support Pretrain");
+    }
+
+    [[nodiscard]] virtual DatasetPtr
+    RangeSearch(const DatasetPtr& query,
+                float radius,
+                const std::string& parameters,
+                const FilterPtr& filter,
+                int64_t limited_size = -1) const = 0;
+
+    [[nodiscard]] virtual DatasetPtr
+    RangeSearch(const DatasetPtr& query,
+                float radius,
+                const std::string& parameters,
+                const BitsetPtr& invalid,
+                int64_t limited_size = -1) const;
+
+    [[nodiscard]] virtual DatasetPtr
+    RangeSearch(const DatasetPtr& query,
+                float radius,
+                const std::string& parameters,
+                const FilterPtr& filter,
+                Allocator* allocator) const {
+        throw std::runtime_error("Index doesn't support new filter");
+    }
+
+    [[nodiscard]] virtual DatasetPtr
+    RangeSearch(const DatasetPtr& query,
+                float radius,
+                const std::string& parameters,
+                const std::function<bool(int64_t)>& filter,
+                int64_t limited_size = -1) const;
+
+    [[nodiscard]] virtual DatasetPtr
+    RangeSearch(const DatasetPtr& query,
+                float radius,
+                const std::string& parameters,
+                int64_t limited_size = -1) const {
+        FilterPtr filter = nullptr;
+        return this->RangeSearch(query, radius, parameters, filter, limited_size);
+    }
+
+    virtual uint32_t
+    Remove(const std::vector<int64_t>& ids, RemoveMode mode = RemoveMode::MARK_REMOVE) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION, "Index doesn't support Remove");
+    }
+
+    virtual uint32_t
+    Remove(int64_t id, RemoveMode mode = RemoveMode::MARK_REMOVE) {
+        return this->Remove(std::vector<int64_t>({id}), mode);
+    }
+
+    [[nodiscard]] virtual DatasetPtr
+    SearchWithRequest(const SearchRequest& request) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support SearchWithRequest");
+    }
+
+    virtual void
+    Serialize(std::ostream& out_stream) const;
+
+    virtual void
+    SerializeStreaming(std::ostream& out_stream) const;
+
+    virtual void
+    Serialize(const WriteFuncType& write_func) const;
+
+    virtual void
+    Serialize(StreamWriter& writer) const = 0;
+
+    [[nodiscard]] virtual BinarySet
+    Serialize() const;
+
+    virtual void
+    SetIO(const std::shared_ptr<Reader> reader) {
+    }
+
+    virtual void
+    SetImmutable() {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support SetImmutable");
+    }
+
+    virtual void
+    ExportCache(std::ostream& out_stream) const {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support ExportCache");
+    }
+
+    virtual void
+    ImportCache(std::istream& in_stream) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support ImportCache");
+    }
+
+    virtual void
+    Train(const DatasetPtr& base){};
+
+    virtual void
+    UpdateAttribute(int64_t id, const AttributeSet& new_attrs) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support UpdateAttribute");
+    }
+
+    virtual void
+    UpdateAttribute(int64_t id, const AttributeSet& new_attrs, const AttributeSet& origin_attrs) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support UpdateAttribute with origin attributes");
+    }
+
+    virtual bool
+    UpdateExtraInfo(const DatasetPtr& new_base);
+
+    virtual bool
+    UpdateId(int64_t old_id, int64_t new_id);
+
+    virtual bool
+    UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update = false) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
+                            "Index doesn't support UpdateVector");
+    }
+
+protected:
+    virtual MetadataPtr
+    collect_streaming_header() const;
+
+    virtual void
+    serialize_streaming_body(StreamWriter& writer) const;
+
+    virtual void
+    deserialize_streaming_body(StreamReader& reader, const MetadataPtr& metadata);
+
+    virtual void
+    load_streaming_body(StreamReader& reader,
+                        const MetadataPtr& metadata,
+                        const LoadParameters& parameters);
+
+    void
+    analyze_quantizer(JsonType& stats,
+                      const float* data,
+                      uint64_t sample_data_size,
+                      int64_t topk,
+                      const std::string& search_param) const;
+
+    virtual DetailDataPtr
+    get_detail_data_by_info(const IndexDetailInfo& info) const;
+
+    float
+    calc_distance_by_id(const float* query, int64_t id, const FlattenInterfacePtr& data) const;
+
+    DatasetPtr
+    cal_distance_by_id(const float* query,
+                       const int64_t* ids,
+                       int64_t count,
+                       const FlattenInterfacePtr& data) const;
+
+    // ========== Search Helper Methods ==========
+    // Common filter composition: combines DeletedIdsFilter with user filter
+    // If use_extra_info_filter is true and extra_infos_ is available,
+    // uses ExtraInfoWrapperFilter; otherwise uses InnerIdWrapperFilter.
+    FilterPtr
+    create_search_filter(const FilterPtr& user_filter, bool use_extra_info_filter = false) const;
+
+    // Pack search results from a distance heap into a Dataset
+    DatasetPtr
+    pack_knn_result(DistHeapPtr& heap, Allocator* allocator = nullptr) const;
+
+    // Pack search results from a distance heap with extra info
+    DatasetPtr
+    pack_knn_result_with_extra_info(DistHeapPtr& heap, Allocator* allocator = nullptr) const;
+
+    // Create an empty search result with optional statistics
+    static DatasetPtr
+    make_empty_result(const std::string& stats_json = "");
+
+    // Write index footer with basic_info metadata
+    static void
+    write_index_footer(StreamWriter& writer, const JsonType& basic_info);
+
+    // Read index footer and return basic_info metadata; returns false if old format
+    static bool
+    read_index_footer(StreamReader& reader, JsonType& basic_info);
+
+    // Validate search query: checks dim and num_elements
+    void
+    validate_search_query(const DatasetPtr& query) const;
+
+    // Validate KNN search arguments: query, k
+    void
+    validate_knn_args(const DatasetPtr& query, int64_t k) const;
+
+    // Validate range search arguments: query, radius, limited_size
+    void
+    validate_range_args(const DatasetPtr& query, float radius, int64_t limited_size) const;
+
+public:
+    LabelTablePtr label_table_{nullptr};
+    mutable std::shared_mutex label_lookup_mutex_{};  // lock for label_lookup_ & labels_
+
+    Allocator* const allocator_{nullptr};
+    int64_t dim_{0};
+
+    mutable bool use_reorder_{false};
+
+    MetricType metric_{MetricType::METRIC_TYPE_L2SQR};
+    DataTypes data_type_{DataTypes::DATA_TYPE_FLOAT};
+
+    IndexFeatureListUPtr index_feature_list_{nullptr};
+
+    const InnerIndexParameterPtr create_param_ptr_{nullptr};
+    std::atomic<bool> immutable_{false};
+
+protected:
+    std::atomic<uint64_t> total_count_{0};
+
+    std::atomic<uint64_t> current_memory_usage_{0};
+    mutable std::shared_mutex memory_usage_mutex_{};
+
+    bool has_raw_vector_{false};
+    bool has_attribute_{false};
+
+    bool use_attribute_filter_{false};
+
+    uint64_t extra_info_size_{0};
+    ExtraInfoInterfacePtr extra_infos_{nullptr};
+
+    uint64_t build_thread_count_{1};
+    int64_t train_sample_count_{65536L};
+
+    std::shared_ptr<SafeThreadPool> thread_pool_{nullptr};
+
+    AttrInvertedInterfacePtr attr_filter_index_{nullptr};
+};
+
+}  // namespace vsag

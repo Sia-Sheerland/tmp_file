@@ -1,0 +1,139 @@
+pull_request_rules:
+  - name: add module/cicd label
+    conditions:
+      - files~=^\.circleci/.*$
+      - files~=^\.github/.*$
+      - files~=^\scripts/.*$
+    actions:
+      label:
+        add:
+          - module/cicd
+
+  - name: add module/docker label
+    conditions:
+      - files~=^docker/.*$
+    actions:
+      label:
+        add:
+          - module/docker
+
+  - name: add module/docs label
+    conditions:
+      - files~=^docs/.*$
+    actions:
+      label:
+        add:
+          - module/docs
+
+  - name: add module/example label
+    conditions:
+      - files~=^examples/.*$
+    actions:
+      label:
+        add:
+          - module/example
+
+  - name: add module/thirdparty label
+    conditions:
+      - files~=^extern/.*$
+    actions:
+      label:
+        add:
+          - module/thirdparty
+
+  - name: add module/api label
+    conditions:
+      - files~=^include/.*$
+    actions:
+      label:
+        add:
+          - module/api
+
+  - name: add module/attr label
+    conditions:
+      - files~=^src/attr/.*$
+    actions:
+      label:
+        add:
+          - module/attr
+
+  - name: add module/datacell label
+    conditions:
+      - files~=^src/datacell/.*$
+      - files~=^src/io/.*$
+      - files~=^src/quantization/.*$
+    actions:
+      label:
+        add:
+          - module/datacell
+
+  - name: add module/index label
+    conditions:
+      - files~=^src/index/.*$
+    actions:
+      label:
+        add:
+          - module/index
+
+  - name: add module/simd label
+    conditions:
+      - files~=^src/simd/.*$
+    actions:
+      label:
+        add:
+          - module/simd
+
+  - name: add module/pyvsag label
+    conditions:
+      - files~=^python/.*$
+      - files~=^python_bindings/.*$
+    actions:
+      label:
+        add:
+          - module/pyvsag
+
+  - name: add module/tools label
+    conditions:
+      - files~=^tools/.*$
+    actions:
+      label:
+        add:
+          - module/tools
+
+  - name: add module/testing label
+    conditions:
+      - files~=^tests/.*$
+    actions:
+      label:
+        add:
+          - module/testing
+merge_protections:
+  - name: Require kind label
+    if:
+      - base=main
+    success_conditions:
+      - label~=^kind/
+
+  - name: Require version label
+    if:
+      - base=main
+    success_conditions:
+      - label~=^version/
+
+  - name: Require linked issue for feature/bug PRs
+    # Defense-in-depth fallback for the `PR Issue Link Check` GitHub
+    # Action. If the Action is ever disabled or skipped, Mergify still
+    # refuses to merge `kind/feature` / `kind/bug` PRs whose description
+    # does not reference an issue via a GitHub auto-closing keyword.
+    if:
+      - or:
+          - base=main
+          - base~=^0\.
+      - or:
+          - label=kind/feature
+          - label=kind/bug
+    success_conditions:
+      - >-
+        body~=(?im)(?:^|[\s\-\*])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:#\d+|[\w.\-]+/[\w.\-]+#\d+|https?://github\.com/[\w.\-]+/[\w.\-]+/issues/\d+)
+merge_protections_settings:
+  reporting_method: check-runs

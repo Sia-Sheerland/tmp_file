@@ -1,0 +1,76 @@
+
+// Copyright 2024-present the vsag project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <limits>
+#include <mutex>
+
+#include "typing.h"
+#include "utils/filter_search_skip_strategy.h"
+#include "utils/pointer_define.h"
+#include "utils/timer.h"
+
+namespace vsag {
+
+DEFINE_POINTER(Filter);
+DEFINE_POINTER(Executor);
+
+enum InnerSearchMode { KNN_SEARCH = 1, RANGE_SEARCH = 2 };
+
+enum InnerSearchType { PURE = 1, WITH_FILTER = 2 };
+
+class InnerSearchParam {
+public:
+    InnerSearchParam() = default;
+
+public:
+    int64_t topk{0};
+    float radius{0.0F};
+    InnerIdType ep{0};
+    uint64_t ef{10};
+    uint32_t hops_limit{std::numeric_limits<uint32_t>::max()};
+    FilterPtr is_inner_id_allowed{nullptr};
+    float skip_ratio{0.2F};
+    FilterSearchSkipStrategyType skip_strategy_type{
+        FilterSearchSkipStrategyType::DETERMINISTIC_ACCUMULATIVE};
+    InnerSearchMode search_mode{KNN_SEARCH};
+    int range_search_limit_size{-1};
+    int64_t parallel_search_thread_count{1};
+    bool enable_rabitq_one_bit_search{false};
+
+    // for ivf
+    int scan_bucket_size{1};
+    float factor{2.0F};
+    bool enable_reorder{true};
+    float first_order_scan_ratio{1.0F};
+    std::vector<ExecutorPtr> executors;
+
+    // deal with duplicate ids
+    mutable int64_t duplicate_id{-1};
+    InnerIdType duplicate_query_id{std::numeric_limits<InnerIdType>::max()};
+    bool find_duplicate{false};
+    float duplicate_distance_threshold{0.0F};
+
+    // use in search process with duplicate ids
+    bool consider_duplicate{false};
+
+    // time record
+    std::shared_ptr<Timer> time_cost{nullptr};
+
+    InnerSearchParam&
+    operator=(const InnerSearchParam& other) = default;
+};
+}  // namespace vsag
