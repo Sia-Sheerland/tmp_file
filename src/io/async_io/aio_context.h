@@ -75,7 +75,7 @@ public:
 
 public:
     /// Default number of concurrent AIO requests supported.
-    static constexpr int64_t DEFAULT_REQUEST_COUNT = 100;
+    static constexpr int64_t DEFAULT_REQUEST_COUNT = 16384;
 
     /// The libaio context handle.
     io_context_t ctx_;
