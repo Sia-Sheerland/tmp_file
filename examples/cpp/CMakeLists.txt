@@ -148,3 +148,6 @@ target_link_libraries(323_index_hgraph_rabitq_split vsag)
 
 add_executable(324_feature_lazy_hgraph_extra_info 324_feature_lazy_hgraph_extra_info.cpp)
 target_link_libraries(324_feature_lazy_hgraph_extra_info vsag)
+
+add_executable(simq_full_pipeline simq_full_pipeline.cpp)
+target_link_libraries(simq_full_pipeline vsag hdf5::hdf5)
