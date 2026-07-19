@@ -169,8 +169,6 @@ static std::string make_build_param(const std::string& mv_file_path,
            "\"max_cluster_size\":160,"
            "\"split_start_idx\":80,"
            "\"coarse_k\":50,"
-           "\"ef_construction\":400,"
-           "\"max_degree\":64,"
            "\"rerank_k\":" + std::to_string(rerank_k_default) +
            "}}";
 }
