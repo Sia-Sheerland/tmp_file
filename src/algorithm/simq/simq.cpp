@@ -142,7 +142,7 @@ HGraphDynamicClustering::build_hgraph(const std::vector<int>& center_ids, int64_
     cp.dim_ = dim;
 
     auto param = HGraph::CheckAndMappingExternalParam(
-        JsonType::Parse("{\"max_degree\":64,\"ef_construction\":400}"), cp);
+        JsonType::Parse("{\"max_degree\":32,\"ef_construction\":50}"), cp);
     hgraph_ = std::make_shared<HGraph>(param, cp);
 
     auto n = static_cast<int64_t>(center_ids.size());
@@ -465,7 +465,7 @@ SIMQ::build_rep_hgraph(const float* flat_vecs, int64_t dim) {
     cp.dim_ = dim;
 
     auto param = HGraph::CheckAndMappingExternalParam(
-        JsonType::Parse("{\"max_degree\":64,\"ef_construction\":400}"), cp);
+        JsonType::Parse("{\"max_degree\":32,\"ef_construction\":50}"), cp);
     rep_hgraph_ = std::make_shared<HGraph>(param, cp);
 
     auto ds = Dataset::Make();
@@ -915,7 +915,7 @@ SIMQ::deserialize_rep_hgraph(StreamReader& reader) {
     cp.dim_ = dim_;
 
     auto param = HGraph::CheckAndMappingExternalParam(
-        JsonType::Parse("{\"max_degree\":64,\"ef_construction\":400}"), cp);
+        JsonType::Parse("{\"max_degree\":32,\"ef_construction\":50}"), cp);
     rep_hgraph_ = std::make_shared<HGraph>(param, cp);
 
     // Use SliceStreamReader so HGraph's footer seeks within its own data only.
