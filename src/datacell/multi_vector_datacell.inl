@@ -206,13 +206,17 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
         return;
     }
 
-    // Step 1: Read all offsets (offset_io_ is MemoryBlockIO, in-memory, fast)
+    // Step 1: Batch read all offsets via MultiRead (offset_io_ is MemoryBlockIO, in-memory)
     std::vector<uint64_t> offsets(id_count);
+    std::vector<uint64_t> offset_sizes(id_count, sizeof(uint64_t));
+    std::vector<uint64_t> offset_offsets(id_count);
     for (InnerIdType i = 0; i < id_count; ++i) {
-        offset_io_->Read(sizeof(uint64_t),
-                         static_cast<uint64_t>(idx[i]) * sizeof(uint64_t),
-                         reinterpret_cast<uint8_t*>(&offsets[i]));
+        offset_offsets[i] = static_cast<uint64_t>(idx[i]) * sizeof(uint64_t);
     }
+    offset_io_->MultiRead(reinterpret_cast<uint8_t*>(offsets.data()),
+                          offset_sizes.data(),
+                          offset_offsets.data(),
+                          static_cast<uint64_t>(id_count));
 
     // Step 2: Batch read all token counts via MultiRead (async IO)
     std::vector<uint32_t> lens(id_count);
