@@ -44,6 +44,9 @@ public:
         j["hops"].SetInt(hops.load(std::memory_order_relaxed));
         j["io_cnt"].SetInt(io_cnt.load(std::memory_order_relaxed));
         j["io_time_ms"].SetInt(io_time_ms.load(std::memory_order_relaxed));
+        j["mv_io_time_ms"].SetInt(mv_io_time_ms.load(std::memory_order_relaxed));
+        j["mv_compute_time_ms"].SetInt(mv_compute_time_ms.load(std::memory_order_relaxed));
+        j["mv_candidate_count"].SetInt(mv_candidate_count.load(std::memory_order_relaxed));
         j["reorder_distance_count"].SetInt(reorder_distance_count.load(std::memory_order_relaxed));
         j["reorder_lower_bound_probe_count"].SetInt(
             reorder_lower_bound_probe_count.load(std::memory_order_relaxed));
@@ -64,6 +67,10 @@ public:
     std::atomic<uint32_t> hops{0};
     std::atomic<uint32_t> io_cnt{0};
     std::atomic<uint32_t> io_time_ms{0};
+    // MultiVectorDataCell::Query breakdown (milliseconds, rounded)
+    std::atomic<uint32_t> mv_io_time_ms{0};       // Step 1 + Step 3 MultiRead
+    std::atomic<uint32_t> mv_compute_time_ms{0};  // Step 4 MaxSim ComputeDist
+    std::atomic<uint32_t> mv_candidate_count{0};  // number of candidates in Query
     std::atomic<uint32_t> reorder_distance_count{0};
     std::atomic<uint32_t> reorder_lower_bound_probe_count{0};
     std::atomic<uint32_t> rabitq_filter_count{0};

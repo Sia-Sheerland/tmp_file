@@ -62,7 +62,10 @@ dump_simq_statistics(const SearchStatistics& stats,
                      bool limited_size_applied,
                      double coarse_ms,
                      double query_ms,
-                     double sort_ms) {
+                     double sort_ms,
+                     uint32_t mv_io_ms,
+                     uint32_t mv_compute_ms,
+                     uint32_t mv_candidates) {
     auto json = JsonType::Parse(stats.Dump());
     json["simq_coarse_dist_cmp"].SetUint64(coarse_dist_cmp);
     json["simq_coarse_probe_count"].SetUint64(coarse_probe_count);
@@ -74,6 +77,9 @@ dump_simq_statistics(const SearchStatistics& stats,
     json["simq_coarse_ms"].SetDouble(coarse_ms);
     json["simq_query_ms"].SetDouble(query_ms);
     json["simq_sort_ms"].SetDouble(sort_ms);
+    json["simq_mv_io_ms"].SetUint(mv_io_ms);
+    json["simq_mv_compute_ms"].SetUint(mv_compute_ms);
+    json["simq_mv_candidates"].SetUint(mv_candidates);
     return json.Dump();
 }
 
@@ -728,7 +734,8 @@ SIMQ::KnnSearch(const DatasetPtr& query,
 
     if (total_count_ == 0 || rep_hgraph_ == nullptr) {
         auto result = Dataset::Make();
-        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0));
+        result->Statistics(
+            dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0, 0, 0, 0));
         return result;
     }
 
@@ -777,16 +784,28 @@ SIMQ::KnnSearch(const DatasetPtr& query,
 
     // Single batched Query call (enables MultiRead in MultiVectorDataCell)
     auto t_query_start = std::chrono::steady_clock::now();
+    uint32_t mv_io_ms = 0;
+    uint32_t mv_compute_ms = 0;
+    uint32_t mv_candidates = 0;
     if (!batch_ids.empty()) {
         std::vector<float> batch_dists(batch_ids.size());
+        // Use QueryContext so MultiVectorDataCell can report fine-grained timing
+        // back through SearchStatistics.
+        QueryContext qctx;
+        qctx.alloc = this->allocator_;
+        qctx.stats = &stats;
         mv_codes_->Query(batch_dists.data(),
                          computer,
                          batch_ids.data(),
-                         static_cast<InnerIdType>(batch_ids.size()));
+                         static_cast<InnerIdType>(batch_ids.size()),
+                         &qctx);
         stats.dist_cmp += batch_ids.size();
         for (uint64_t i = 0; i < batch_ids.size(); i++) {
             reranked.emplace_back(batch_dists[i], batch_ids[i]);
         }
+        mv_io_ms = stats.mv_io_time_ms.load(std::memory_order_relaxed);
+        mv_compute_ms = stats.mv_compute_time_ms.load(std::memory_order_relaxed);
+        mv_candidates = stats.mv_candidate_count.load(std::memory_order_relaxed);
     }
     double query_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_query_start).count();
@@ -814,7 +833,10 @@ SIMQ::KnnSearch(const DatasetPtr& query,
                                                false,
                                                coarse_ms,
                                                query_ms,
-                                               sort_ms));
+                                               sort_ms,
+                                               mv_io_ms,
+                                               mv_compute_ms,
+                                               mv_candidates));
     return std::move(result_ds);
 }
 
@@ -833,7 +855,8 @@ SIMQ::RangeSearch(const DatasetPtr& query,
 
     if (total_count_ == 0 || rep_hgraph_ == nullptr) {
         auto result = Dataset::Make();
-        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0));
+        result->Statistics(
+            dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0, 0, 0, 0));
         return result;
     }
 
@@ -915,7 +938,10 @@ SIMQ::RangeSearch(const DatasetPtr& query,
                                                limited_size_applied,
                                                coarse_ms,
                                                query_ms,
-                                               sort_ms));
+                                               sort_ms,
+                                               0,
+                                               0,
+                                               0));
     return std::move(result_ds);
 }
 

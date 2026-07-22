@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "common.h"
@@ -239,7 +240,10 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
         return;
     }
 
+    SearchStatistics* stats = (ctx != nullptr) ? ctx->stats : nullptr;
+
     // Step 1: Batch read all offsets via MultiRead (offset_io_ is MemoryBlockIO, in-memory)
+    auto t_io_start = std::chrono::steady_clock::now();
     std::vector<uint64_t> offsets(id_count);
     std::vector<uint64_t> offset_sizes(id_count, sizeof(uint64_t));
     std::vector<uint64_t> offset_offsets(id_count);
@@ -268,8 +272,11 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
                          data_sizes.data(),
                          offsets.data(),
                          static_cast<uint64_t>(id_count));
+    double io_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_io_start).count();
 
     // Step 4: Compute MaxSim distances
+    auto t_compute_start = std::chrono::steady_clock::now();
     uint64_t cursor = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
         const uint32_t token_count = token_counts_[idx[i]];
@@ -277,8 +284,20 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
             all_codes + cursor + sizeof(uint32_t), token_count, result_dists + i);
         cursor += data_sizes[i];
     }
+    double compute_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_compute_start).count();
 
     this->allocator_->Deallocate(all_codes);
+
+    // Populate SearchStatistics with fine-grained breakdown (rounded to ms)
+    if (stats != nullptr) {
+        stats->mv_io_time_ms.fetch_add(static_cast<uint32_t>(io_ms + 0.5),
+                                       std::memory_order_relaxed);
+        stats->mv_compute_time_ms.fetch_add(static_cast<uint32_t>(compute_ms + 0.5),
+                                            std::memory_order_relaxed);
+        stats->mv_candidate_count.fetch_add(static_cast<uint32_t>(id_count),
+                                            std::memory_order_relaxed);
+    }
 }
 
 template <typename QuantTmpl, typename IOTmpl>
