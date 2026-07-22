@@ -83,6 +83,12 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::InsertVector(const void* vector, InnerId
                       sizeof(old_offset),
                       static_cast<uint64_t>(idx) * sizeof(old_offset));
     io_->Write(codes.data, code_size, old_offset);
+
+    // Cache the token count in memory so Query can skip the disk read
+    if (static_cast<uint64_t>(idx) >= token_counts_.size()) {
+        token_counts_.resize(static_cast<uint64_t>(idx) + 1, 0);
+    }
+    token_counts_[idx] = multi_vector->len_;
 }
 
 template <typename QuantTmpl, typename IOTmpl>
@@ -115,6 +121,9 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Resize(InnerIdType new_capacity) {
         return;
     }
     this->offset_io_->Resize(static_cast<uint64_t>(new_capacity) * sizeof(uint64_t));
+    if (static_cast<uint64_t>(new_capacity) > token_counts_.size()) {
+        token_counts_.resize(static_cast<uint64_t>(new_capacity), 0);
+    }
     this->max_capacity_ = new_capacity;
 }
 
@@ -177,6 +186,30 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Deserialize(lvalue_or_rvalue<StreamReade
     this->offset_io_->Deserialize(reader);
     this->io_->Deserialize(reader);
     this->quantizer_->Deserialize(reader);
+
+    // Rebuild token_counts_ cache using batched MultiRead so Query does not need
+    // a separate io_submit to fetch token counts from disk.
+    if (this->total_count_ > 0) {
+        std::vector<uint64_t> offsets(static_cast<uint64_t>(this->total_count_));
+        std::vector<uint64_t> off_sizes(static_cast<uint64_t>(this->total_count_),
+                                        sizeof(uint64_t));
+        std::vector<uint64_t> off_offs(static_cast<uint64_t>(this->total_count_));
+        for (InnerIdType i = 0; i < this->total_count_; ++i) {
+            off_offs[i] = static_cast<uint64_t>(i) * sizeof(uint64_t);
+        }
+        offset_io_->MultiRead(reinterpret_cast<uint8_t*>(offsets.data()),
+                              off_sizes.data(),
+                              off_offs.data(),
+                              static_cast<uint64_t>(this->total_count_));
+
+        token_counts_.resize(static_cast<uint64_t>(this->total_count_));
+        std::vector<uint64_t> tc_sizes(static_cast<uint64_t>(this->total_count_),
+                                       sizeof(uint32_t));
+        this->io_->MultiRead(reinterpret_cast<uint8_t*>(token_counts_.data()),
+                             tc_sizes.data(),
+                             offsets.data(),
+                             static_cast<uint64_t>(this->total_count_));
+    }
 }
 
 template <typename QuantTmpl, typename IOTmpl>
@@ -218,22 +251,18 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
                           offset_offsets.data(),
                           static_cast<uint64_t>(id_count));
 
-    // Step 2: Batch read all token counts via MultiRead (async IO)
-    std::vector<uint32_t> lens(id_count);
-    std::vector<uint64_t> len_sizes(id_count, sizeof(uint32_t));
-    this->io_->MultiRead(reinterpret_cast<uint8_t*>(lens.data()),
-                         len_sizes.data(),
-                         offsets.data(),
-                         static_cast<uint64_t>(id_count));
-
-    // Step 3: Batch read all data via MultiRead (async IO)
+    // Step 2: Look up token counts from in-memory cache (no disk IO)
+    //         Populated by InsertVector (Build) or rebuilt in Deserialize.
     std::vector<uint64_t> data_sizes(id_count);
     uint64_t total_size = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
+        const uint32_t token_count = token_counts_[idx[i]];
         data_sizes[i] = sizeof(uint32_t) +
-                        static_cast<uint64_t>(lens[i]) * multi_vector_dim_ * sizeof(float);
+                        static_cast<uint64_t>(token_count) * multi_vector_dim_ * sizeof(float);
         total_size += data_sizes[i];
     }
+
+    // Step 3: Batch read all data via MultiRead (async IO)
     auto* all_codes = static_cast<uint8_t*>(this->allocator_->Allocate(total_size));
     this->io_->MultiRead(all_codes,
                          data_sizes.data(),
@@ -243,7 +272,7 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
     // Step 4: Compute MaxSim distances
     uint64_t cursor = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
-        uint32_t token_count = lens[i];
+        const uint32_t token_count = token_counts_[idx[i]];
         mv_computer->ComputeDist(
             all_codes + cursor + sizeof(uint32_t), token_count, result_dists + i);
         cursor += data_sizes[i];
@@ -261,6 +290,7 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::GetMemoryUsage() const {
         memory += this->io_->GetMemoryUsage();
     }
     memory += sizeof(QuantTmpl);
+    memory += token_counts_.capacity() * sizeof(uint32_t);
     return memory;
 }
 
