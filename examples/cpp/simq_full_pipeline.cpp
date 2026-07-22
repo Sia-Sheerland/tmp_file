@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
     std::vector<int> eval_ks = {10, 20, 50, 100};
 
     std::ofstream log(out_txt);
-    log << "coarse_k,avg_ms,qps,avg_nret,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
+    log << "coarse_k,avg_ms,qps,avg_nret,avg_coarse_ms,avg_query_ms,avg_sort_ms,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
 
     for (int ck : sweep) {
         std::string search_param = make_search_param(ck, rerank_full);
@@ -326,6 +326,9 @@ int main(int argc, char** argv) {
         double total_s = 0.0;
         std::vector<double> recall_sum(eval_ks.size(), 0.0);
         double nret_sum = 0.0;
+        double coarse_ms_sum = 0.0;
+        double query_ms_sum = 0.0;
+        double sort_ms_sum = 0.0;
 
         for (int64_t qi = 0; qi < qnum; ++qi) {
             auto ds = vsag::Dataset::Make();
@@ -349,6 +352,15 @@ int main(int argc, char** argv) {
             int64_t nret = result->GetDim();  // KNN result dim = topK; num_elements = query count
             nret_sum += static_cast<double>(nret);
 
+            // Read per-phase timings from statistics JSON
+            auto timing_vals = result->GetStatistics(
+                {"simq_coarse_ms", "simq_query_ms", "simq_sort_ms"});
+            if (timing_vals.size() == 3) {
+                if (!timing_vals[0].empty()) coarse_ms_sum += std::stod(timing_vals[0]);
+                if (!timing_vals[1].empty()) query_ms_sum += std::stod(timing_vals[1]);
+                if (!timing_vals[2].empty()) sort_ms_sum += std::stod(timing_vals[2]);
+            }
+
             for (size_t ei = 0; ei < eval_ks.size(); ++ei) {
                 int k = eval_ks[ei];
 
@@ -370,11 +382,17 @@ int main(int argc, char** argv) {
 
         double avg_ms = total_s * 1000.0 / static_cast<double>(qnum);
         double qps = static_cast<double>(qnum) / total_s;
+        double avg_coarse_ms = coarse_ms_sum / qnum;
+        double avg_query_ms = query_ms_sum / qnum;
+        double avg_sort_ms = sort_ms_sum / qnum;
 
         std::cout << "coarse=" << ck
                   << " avg_ms=" << avg_ms
                   << " qps=" << qps
                   << " avg_nret=" << nret_sum / qnum
+                  << " coarse=" << avg_coarse_ms << "ms"
+                  << " query=" << avg_query_ms << "ms"
+                  << " sort=" << avg_sort_ms << "ms"
                   << " r10=" << recall_sum[0] / qnum
                   << " r20=" << recall_sum[1] / qnum
                   << " r50=" << recall_sum[2] / qnum
@@ -385,6 +403,9 @@ int main(int argc, char** argv) {
             << avg_ms << ","
             << qps << ","
             << nret_sum / qnum << ","
+            << avg_coarse_ms << ","
+            << avg_query_ms << ","
+            << avg_sort_ms << ","
             << recall_sum[0] / qnum << ","
             << recall_sum[1] / qnum << ","
             << recall_sum[2] / qnum << ","

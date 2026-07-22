@@ -16,6 +16,7 @@
 #include "simq.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -58,7 +59,10 @@ dump_simq_statistics(const SearchStatistics& stats,
                      uint64_t rerank_candidate_count,
                      uint64_t filtered_candidate_count,
                      uint64_t result_count,
-                     bool limited_size_applied) {
+                     bool limited_size_applied,
+                     double coarse_ms,
+                     double query_ms,
+                     double sort_ms) {
     auto json = JsonType::Parse(stats.Dump());
     json["simq_coarse_dist_cmp"].SetUint64(coarse_dist_cmp);
     json["simq_coarse_probe_count"].SetUint64(coarse_probe_count);
@@ -67,6 +71,9 @@ dump_simq_statistics(const SearchStatistics& stats,
     json["simq_filtered_candidate_count"].SetUint64(filtered_candidate_count);
     json["simq_result_count"].SetUint64(result_count);
     json["simq_limited_size_applied"].SetBool(limited_size_applied);
+    json["simq_coarse_ms"].SetDouble(coarse_ms);
+    json["simq_query_ms"].SetDouble(query_ms);
+    json["simq_sort_ms"].SetDouble(sort_ms);
     return json.Dump();
 }
 
@@ -721,7 +728,7 @@ SIMQ::KnnSearch(const DatasetPtr& query,
 
     if (total_count_ == 0 || rep_hgraph_ == nullptr) {
         auto result = Dataset::Make();
-        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false));
+        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0));
         return result;
     }
 
@@ -740,8 +747,11 @@ SIMQ::KnnSearch(const DatasetPtr& query,
 
     uint64_t coarse_dist_cmp = 0;
     uint64_t coarse_probe_count = 0;
+    auto t_coarse_start = std::chrono::steady_clock::now();
     auto coarse_results = coarse_search(
         query_mvs[0].vectors_, query_mvs[0].len_, coarse_k, &coarse_dist_cmp, &coarse_probe_count);
+    double coarse_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_coarse_start).count();
     uint64_t coarse_candidate_count = coarse_results.size();
     if (static_cast<int64_t>(coarse_results.size()) > rerank_k) {
         coarse_results.resize(rerank_k);
@@ -766,6 +776,7 @@ SIMQ::KnnSearch(const DatasetPtr& query,
     }
 
     // Single batched Query call (enables MultiRead in MultiVectorDataCell)
+    auto t_query_start = std::chrono::steady_clock::now();
     if (!batch_ids.empty()) {
         std::vector<float> batch_dists(batch_ids.size());
         mv_codes_->Query(batch_dists.data(),
@@ -777,9 +788,15 @@ SIMQ::KnnSearch(const DatasetPtr& query,
             reranked.emplace_back(batch_dists[i], batch_ids[i]);
         }
     }
+    double query_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_query_start).count();
+
+    auto t_sort_start = std::chrono::steady_clock::now();
     std::sort(reranked.begin(), reranked.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
     });
+    double sort_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_sort_start).count();
 
     int64_t result_count = std::min(k, static_cast<int64_t>(reranked.size()));
     auto [result_ds, dists, ids] = create_fast_dataset(result_count, allocator_);
@@ -794,7 +811,10 @@ SIMQ::KnnSearch(const DatasetPtr& query,
                                                rerank_candidate_count,
                                                filtered_candidate_count,
                                                static_cast<uint64_t>(result_count),
-                                               false));
+                                               false,
+                                               coarse_ms,
+                                               query_ms,
+                                               sort_ms));
     return std::move(result_ds);
 }
 
@@ -813,7 +833,7 @@ SIMQ::RangeSearch(const DatasetPtr& query,
 
     if (total_count_ == 0 || rep_hgraph_ == nullptr) {
         auto result = Dataset::Make();
-        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false));
+        result->Statistics(dump_simq_statistics(stats, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0));
         return result;
     }
 
@@ -833,8 +853,11 @@ SIMQ::RangeSearch(const DatasetPtr& query,
 
     uint64_t coarse_dist_cmp = 0;
     uint64_t coarse_probe_count = 0;
+    auto t_coarse_start = std::chrono::steady_clock::now();
     auto coarse_results = coarse_search(
         query_mvs[0].vectors_, query_mvs[0].len_, coarse_k, &coarse_dist_cmp, &coarse_probe_count);
+    double coarse_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_coarse_start).count();
     uint64_t coarse_candidate_count = coarse_results.size();
     if (static_cast<int64_t>(coarse_results.size()) > rerank_k) {
         coarse_results.resize(rerank_k);
@@ -844,6 +867,7 @@ SIMQ::RangeSearch(const DatasetPtr& query,
     auto computer = mv_codes_->FactoryComputer(&query_mvs[0]);
     std::vector<std::pair<float, InnerIdType>> in_range;
     uint64_t filtered_candidate_count = 0;
+    auto t_query_start = std::chrono::steady_clock::now();
     for (auto& [doc_id, _] : coarse_results) {
         if (filter != nullptr && !filter->CheckValid(this->label_table_->GetLabelById(doc_id))) {
             ++filtered_candidate_count;
@@ -856,6 +880,8 @@ SIMQ::RangeSearch(const DatasetPtr& query,
             in_range.emplace_back(dist, doc_id);
         }
     }
+    double query_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_query_start).count();
 
     bool limited_size_applied = false;
     if (limited_size >= 0 && static_cast<int64_t>(in_range.size()) > limited_size) {
@@ -866,9 +892,12 @@ SIMQ::RangeSearch(const DatasetPtr& query,
                          [](const auto& a, const auto& b) { return a.first < b.first; });
         in_range.resize(limited_size);
     }
+    auto t_sort_start = std::chrono::steady_clock::now();
     std::sort(in_range.begin(), in_range.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
     });
+    double sort_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_sort_start).count();
 
     auto [result_ds, dists, ids] =
         create_fast_dataset(static_cast<int64_t>(in_range.size()), allocator_);
@@ -883,7 +912,10 @@ SIMQ::RangeSearch(const DatasetPtr& query,
                                                rerank_candidate_count,
                                                filtered_candidate_count,
                                                static_cast<uint64_t>(in_range.size()),
-                                               limited_size_applied));
+                                               limited_size_applied,
+                                               coarse_ms,
+                                               query_ms,
+                                               sort_ms));
     return std::move(result_ds);
 }
 
