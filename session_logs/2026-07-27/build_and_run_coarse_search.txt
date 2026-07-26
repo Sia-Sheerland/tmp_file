@@ -1,0 +1,66 @@
+# SimQ try_3_temp4 风格 IO + inline SIMD 测试
+# 分支：perf/coarse-search-flat-array
+# 目的：验证 try_3_temp4 风格的两大优化 + 恢复 O_DIRECT 能否显著提升性能
+
+# ─────────────────────────────────────────────
+# 1. 拉代码 + 重编
+# ─────────────────────────────────────────────
+cd /workspace/tmp_file
+git pull origin perf/coarse-search-flat-array
+
+# 这次改了 4 个文件（multi_vector_computer.cpp, async_io.h/.cpp, multi_vector_datacell.inl）
+# 保险起见全清 object 重编
+find build-release -name "*.cpp.o" -delete
+make release -j$(nproc)
+
+g++ -std=c++17 -O2 -I include -I /usr/include/hdf5/serial \
+    examples/cpp/simq_full_pipeline.cpp \
+    -L build-release/src -lvsag \
+    -L /usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 \
+    -lpthread -o /tmp/simq_full_new
+
+# ─────────────────────────────────────────────
+# 2. 跑性能测试（load 模式，复用现有索引）
+# ─────────────────────────────────────────────
+# 索引文件 /tmp/simq_index.bin 和 /tmp/simq_mv_codes.bin 是 async_io 模式建的
+# 这次改的是 Query 代码（不是文件格式），可以直接 load
+
+LD_LIBRARY_PATH=/workspace/tmp_file/build-release/src:$LD_LIBRARY_PATH \
+  stdbuf -oL /tmp/simq_full_new \
+    /dataset/multi_vec_20260513.hdf5 1000000 load \
+  2>&1 | tee /tmp/simq_output_try3_style.log
+
+# ─────────────────────────────────────────────
+# 3. 这次改动的三个优化
+# ─────────────────────────────────────────────
+#
+# (1) try_3_temp4 风格 IO（AsyncIO 新加 MultiReadInPlaceImpl）
+#     - 给每个 doc 单独 posix_memalign 对齐 buffer
+#     - 单次 io_submit 提交全部 2322 个读请求（不切 400 的 chunk）
+#     - 单次 io_getevents 等待全部完成
+#     - Compute 直接从 per-doc buffer 读数据（没有 memcpy 到 all_codes）
+#
+# (2) ComputeDist 内联 SIMD
+#     - 把 FP32ComputeIP 函数指针调用改成 inline 标量循环
+#     - 编译器 -O3 -march=native 自动向量化到 AVX2/AVX-512
+#     - 消除 2M+ 次函数指针调用开销
+#
+# (3) 恢复 O_DIRECT
+#     - 配合 #1 达到硬件极限
+#     - 之前 page cache 实验效果不明显，回退
+
+# ─────────────────────────────────────────────
+# 4. 预期效果
+# ─────────────────────────────────────────────
+#
+# 基线：/tmp/simq_output_coarse_flat_array.log（之前 async_io 版本）
+#
+# | 指标         | 基线        | 预期         |
+# |--------------|-------------|--------------|
+# | mv_io        | 60-70ms     | 47-50ms      |
+# | mv_compute   | 6-7ms       | ~2ms         |
+# | QPS          | 10-12       | 18-22        |
+# | Recall@K     | 不变        | 不变         |
+#
+# 如果 mv_io 真的接近 47ms，说明达到了 fio 测出的 1.67 GB/s 硬件极限
+# 如果 mv_compute 真的降到 2ms，说明函数指针开销被消除了

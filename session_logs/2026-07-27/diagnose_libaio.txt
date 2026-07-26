@@ -1,0 +1,26 @@
+# 诊断 libaio 是否真的被调用
+
+# 方法 1: 看 libvsag.so 里的 io_submit 符号(最快)
+nm /workspace/tmp_file/build-release/src/libvsag.so | grep -iE "io_submit|io_getevents|io_setup"
+
+# 解读:
+#   看到 "U io_submit"  → 代码调用了 io_submit (libaio 生效 ✓)
+#   看到 "U io_getevents"  → 代码调用了 io_getevents ✓
+#   啥都没有 → 代码里没调用 libaio (走了同步 pread 路径 ✗)
+
+# ─────────────────────────────────────────────
+# 方法 2: 如果方法 1 不确定,加一行 printf 验证
+# 编辑 /workspace/tmp_file/src/io/async_io/async_io.cpp
+# 在 MultiReadImpl 函数开头加一行:
+#   std::cerr << "[AsyncIO::MultiReadImpl] count=" << count << std::endl;
+# 然后重编:
+#   find build-release -name "*.cpp.o" -delete
+#   make release -j$(nproc)
+#   g++ -std=c++17 -O2 -I include -I /usr/include/hdf5/serial \
+#       examples/cpp/simq_full_pipeline.cpp \
+#       -L build-release/src -lvsag \
+#       -L /usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 \
+#       -lpthread -o /tmp/simq_full_new
+# 跑一次,看 stderr 里有没有 "[AsyncIO::MultiReadImpl]" 输出
+# 如果有 → libaio 路径生效 ✓
+# 如果没 → libaio 没被调用 ✗

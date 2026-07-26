@@ -1,0 +1,75 @@
+# SimQ token_counts_ 内存缓存优化 — 编译运行流程
+# 分支：perf/multiread-offsets-step1
+# 改动：
+#   commit 1: Step 1 offset 读取改 MultiRead（风格统一）
+#   commit 2: 新增 token_counts_ 内存缓存，砍掉 Query Step 2 的异步 IO
+#             每次查询少一次 io_submit + io_getevents 往返
+
+# ─────────────────────────────────────────────
+# 编译
+# ─────────────────────────────────────────────
+
+cd /workspace/tmp_file
+git pull origin perf/multiread-offsets-step1
+
+# 本次改了 .h + .inl，建议全清 object 重编避免依赖遗漏
+find build-release -name "*.cpp.o" -delete
+
+# 重编 vsag（release 模式，全核并行）
+make release -j$(nproc)
+
+# 编译 simq_full_pipeline 测试程序
+g++ -std=c++17 -O2 \
+    -I include \
+    -I /usr/include/hdf5/serial \
+    examples/cpp/simq_full_pipeline.cpp \
+    -L build-release/src -lvsag \
+    -L /usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 \
+    -lpthread \
+    -o /tmp/simq_full_new
+
+# ─────────────────────────────────────────────
+# 运行（load 模式，索引已建好直接加载）
+# ─────────────────────────────────────────────
+
+LD_LIBRARY_PATH=/workspace/tmp_file/build-release/src:$LD_LIBRARY_PATH \
+  stdbuf -oL /tmp/simq_full_new \
+    /dataset/multi_vec_20260513.hdf5 1000000 load \
+  2>&1 | tee /tmp/simq_output_token_cache.log
+
+# ─────────────────────────────────────────────
+# 参数说明
+# ─────────────────────────────────────────────
+# simq_full_pipeline 参数：
+#   argv[1] = hdf5 数据集路径（默认 /dataset/multi_vec_20260513.hdf5）
+#   argv[2] = base_docs 数量（默认 1000000）
+#   argv[3] = mode: auto | rebuild | load
+#       auto    — 索引文件不存在就 build，存在就 load
+#       rebuild — 强制重建索引
+#       load    — 强制从 /tmp/simq_index.bin 加载，不 build
+#
+# 输出文件：
+#   /tmp/simq_index.bin            — 序列化后的索引
+#   /tmp/simq_mv_codes.bin         — async_io 后端存储的 mv codes
+#   /tmp/simq_eval.txt             — 评估结果 CSV
+#   /tmp/simq_output_token_cache.log — 本次运行的终端输出
+
+# ─────────────────────────────────────────────
+# 预期行为
+# ─────────────────────────────────────────────
+# - Deserialize 时多一次性的 batch rebuild
+#   （用 MultiRead 把全量 token counts 读到内存），
+#   首次加载会稍微慢一点（只发生一次）
+# - 之后每次 Query 少一次 io_submit + io_getevents 往返，QPS 应该提升
+# - 内存占用多 total_count * 4 字节
+#   （100 万 doc ≈ 4 MB，可忽略）
+
+# ─────────────────────────────────────────────
+# 对比指标
+# ─────────────────────────────────────────────
+# 重点看各 coarse_k 档位（300/600/900/1500/2400/3600/4000）的
+#   avg_ms（平均延迟 ms）
+#   qps（每秒查询数）
+# 与改之前的数据对比，确认砍掉 Step 2 后的性能提升。
+# coarse_k 越大提升越明显，因为 Step 2 的 io_submit 提交量
+# 随候选数线性增长，现在变成纯开销被省掉了。
