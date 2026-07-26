@@ -163,7 +163,7 @@ static std::string make_build_param(const std::string& mv_file_path,
            "\"metric_type\":\"ip\","
            "\"dim\":256,"
            "\"index_param\":{"
-           "\"base_io_type\":\"memory_io\","
+           "\"base_io_type\":\"async_io\","
            "\"base_file_path\":\"" + mv_file_path + "\","
            "\"init_cluster_ratio\":0.1,"
            "\"max_cluster_size\":160,"
@@ -313,7 +313,18 @@ int main(int argc, char** argv) {
         qv[static_cast<size_t>(i)].vectors_ = test.data() + test_offsets[i] * dim;
     }
 
-    std::vector<int> sweep = {300, 600, 900, 1500, 2400, 3600, 4000};
+    // Sweep coarse_k (= HNSW m in try_3 reference): probes per query token
+    //   2 (min)
+    //   5,10,...,50  step 5
+    //   60,70,...,100  step 10
+    //   150,200,...,1000  step 50
+    //   1250,1500,...,3000  step 250
+    std::vector<int> sweep;
+    sweep.push_back(2);
+    for (int v = 5; v <= 50; v += 5) sweep.push_back(v);
+    for (int v = 60; v <= 100; v += 10) sweep.push_back(v);
+    for (int v = 150; v <= 1000; v += 50) sweep.push_back(v);
+    for (int v = 1250; v <= 3000; v += 250) sweep.push_back(v);
 
     std::vector<int> eval_ks = {10, 20, 50, 100};
 
