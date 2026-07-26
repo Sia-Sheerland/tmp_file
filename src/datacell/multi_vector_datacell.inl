@@ -318,6 +318,19 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
 
     this->allocator_->Deallocate(all_codes);
 
+    // Per-query IO diagnostic output
+    if (id_count > 0 && io_ms > 0.0) {
+        double iops = static_cast<double>(id_count) / (io_ms / 1000.0);
+        double bw_mb_s = static_cast<double>(total_size) / (io_ms / 1000.0) / 1e6;
+        std::fprintf(stderr,
+                     "[SIMQ Query] candidates=%u io_ms=%.2f iops=%.1f data_mb=%.2f bw_mb_s=%.1f\n",
+                     static_cast<unsigned>(id_count),
+                     io_ms,
+                     iops,
+                     static_cast<double>(total_size) / 1e6,
+                     bw_mb_s);
+    }
+
     // Populate SearchStatistics with fine-grained breakdown (rounded to ms)
     if (stats != nullptr) {
         stats->mv_io_time_ms.fetch_add(static_cast<uint32_t>(io_ms + 0.5),
