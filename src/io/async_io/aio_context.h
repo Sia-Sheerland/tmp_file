@@ -75,7 +75,12 @@ public:
 
 public:
     /// Default number of concurrent AIO requests supported.
-    static constexpr int64_t DEFAULT_REQUEST_COUNT = 400;
+    /// Bumped from 400 to 4096 so a typical rerank batch (~2000-3000 docs) can
+    /// be submitted in a single io_submit call instead of being chunked into
+    /// 5-8 serial batches. The memory cost is modest: each IOContext uses
+    /// ~64KB extra for the iocb/events arrays. io_setup(4096) is well within
+    /// Linux kernel limits (default /proc/sys/fs/aio-max-nr is 65536).
+    static constexpr int64_t DEFAULT_REQUEST_COUNT = 4096;
 
     /// The libaio context handle.
     io_context_t ctx_;
