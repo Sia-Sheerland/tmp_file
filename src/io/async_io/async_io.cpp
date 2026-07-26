@@ -38,7 +38,14 @@ AsyncIO::AsyncIO(std::string filename, Allocator* allocator)
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("{} is a directory", this->filepath_));
     }
-    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+    // NOTE: removed O_DIRECT from rfd_ to allow reads to go through the page
+    // cache. When the data is hot in RAM (common for repeated queries on the
+    // same index), pread becomes memcpy-from-RAM (~10 GB/s) instead of a
+    // disk round-trip (~1-2 GB/s random IO). This matches the behaviour of
+    // reference implementations like SIMQ_try_3 which open files with
+    // O_RDONLY only. Trade-off: loses deterministic bypass of page cache,
+    // but gains much higher throughput when data fits in RAM.
+    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR, 0644);
     if (this->rfd_ < 0) {
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("open file {} error {}", this->filepath_, strerror(errno)));
