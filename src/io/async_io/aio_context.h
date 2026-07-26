@@ -75,12 +75,14 @@ public:
 
 public:
     /// Default number of concurrent AIO requests supported.
-    /// Bumped from 400 to 4096 so a typical rerank batch (~2000-3000 docs) can
-    /// be submitted in a single io_submit call instead of being chunked into
-    /// 5-8 serial batches. The memory cost is modest: each IOContext uses
-    /// ~64KB extra for the iocb/events arrays. io_setup(4096) is well within
-    /// Linux kernel limits (default /proc/sys/fs/aio-max-nr is 65536).
-    static constexpr int64_t DEFAULT_REQUEST_COUNT = 4096;
+    /// Tuning notes (2026-07-27): increasing from 400 to 4096 did NOT improve
+    /// throughput on the target workload (2322-doc rerank batches). The
+    /// bottleneck is actual NVMe IO time (~40-50ms) plus CPU overhead from
+    /// per-request posix_memalign/memcpy/free (~10ms). Larger batches hurt
+    /// slightly due to tail latency — with 2322 concurrent IOs, the slowest
+    /// one is slower than the slowest of 400 (extreme-value statistics).
+    /// 400 remains the sweet spot for this workload.
+    static constexpr int64_t DEFAULT_REQUEST_COUNT = 400;
 
     /// The libaio context handle.
     io_context_t ctx_;
