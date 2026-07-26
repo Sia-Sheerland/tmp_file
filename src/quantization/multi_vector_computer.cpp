@@ -50,48 +50,35 @@ MultiVectorComputer::ComputeDist(const uint8_t* codes, uint32_t token_count, flo
     const auto* doc_tokens = reinterpret_cast<const float*>(codes);
     float total = 0.0F;
 
-    // NOTE: replaced FP32ComputeIP/FP32ComputeL2Sqr function-pointer calls with
-    // inline scalar loops. The compiler (-O3 -march=native) auto-vectorizes
-    // these to AVX2/AVX-512 at compile time, eliminating ~5-15ms of per-call
-    // function-pointer overhead across 2M+ dot-product calls per query.
-    // Matches the inline-scalar approach used in reference SIMQ_try_3_temp4.
     if (metric_ == MetricType::METRIC_TYPE_IP) {
         for (uint32_t q = 0; q < query_token_count_; ++q) {
             const float* q_tok = query_tokens_.data() + static_cast<uint64_t>(q) * dim_;
-            float max_ip = -std::numeric_limits<float>::max();
+            float min_dist = std::numeric_limits<float>::max();
 
             for (uint32_t d = 0; d < token_count; ++d) {
                 const float* d_tok = doc_tokens + static_cast<uint64_t>(d) * dim_;
-                float ip = 0.0F;
-                for (uint32_t k = 0; k < dim_; ++k) {
-                    ip += q_tok[k] * d_tok[k];
-                }
-                if (ip > max_ip) {
-                    max_ip = ip;
+                float dist_val = 1.0F - FP32ComputeIP(q_tok, d_tok, dim_);
+                if (dist_val < min_dist) {
+                    min_dist = dist_val;
                 }
             }
 
-            // max_ip is the best dot product; dist = 1 - max_ip (smaller = better)
-            total += (1.0F - max_ip);
+            total += min_dist;
         }
     } else if (metric_ == MetricType::METRIC_TYPE_L2SQR) {
         for (uint32_t q = 0; q < query_token_count_; ++q) {
             const float* q_tok = query_tokens_.data() + static_cast<uint64_t>(q) * dim_;
-            float min_l2 = std::numeric_limits<float>::max();
+            float min_dist = std::numeric_limits<float>::max();
 
             for (uint32_t d = 0; d < token_count; ++d) {
                 const float* d_tok = doc_tokens + static_cast<uint64_t>(d) * dim_;
-                float l2 = 0.0F;
-                for (uint32_t k = 0; k < dim_; ++k) {
-                    float diff = q_tok[k] - d_tok[k];
-                    l2 += diff * diff;
-                }
-                if (l2 < min_l2) {
-                    min_l2 = l2;
+                float dist_val = FP32ComputeL2Sqr(q_tok, d_tok, dim_);
+                if (dist_val < min_dist) {
+                    min_dist = dist_val;
                 }
             }
 
-            total += min_l2;
+            total += min_dist;
         }
     } else {
         throw VsagException(ErrorType::INVALID_ARGUMENT,

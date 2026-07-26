@@ -38,7 +38,9 @@ AsyncIO::AsyncIO(std::string filename, Allocator* allocator)
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("{} is a directory", this->filepath_));
     }
-    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+    // NOTE: removed O_DIRECT to allow reads to go through the page cache.
+    // When data fits in RAM, this gives much higher throughput than O_DIRECT.
+    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR, 0644);
     if (this->rfd_ < 0) {
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("open file {} error {}", this->filepath_, strerror(errno)));
@@ -192,59 +194,6 @@ AsyncIO::MultiReadImpl(uint8_t* datas, uint64_t* sizes, uint64_t* offsets, uint6
         offsets += count;
         all_count -= static_cast<int64_t>(count);
     }
-    io_context_pool->ReturnOne(context);
-    return true;
-}
-
-bool
-AsyncIO::MultiReadInPlaceImpl(const AsyncIO::AioSlot* slots, uint64_t count) const {
-    if (count == 0) {
-        return true;
-    }
-    auto context = io_context_pool->TakeOne();
-    const auto n = static_cast<int64_t>(count);
-
-    // Build iocb array for all slots at once.
-    std::vector<struct iocb> cbs(static_cast<uint64_t>(n));
-    std::vector<struct iocb*> cbptrs(static_cast<uint64_t>(n));
-    for (int64_t i = 0; i < n; ++i) {
-        const auto& slot = slots[i];
-        io_prep_pread(&cbs[i],
-                      rfd_,
-                      slot.buffer,
-                      static_cast<uint64_t>(slot.read_size),
-                      static_cast<int64_t>(slot.aligned_offset));
-        cbptrs[i] = &cbs[i];
-    }
-
-    // Single io_submit for the entire batch (no chunking).
-    int submitted = io_submit(context->ctx_, n, cbptrs.data());
-    if (submitted < 0) {
-        io_context_pool->ReturnOne(context);
-        throw VsagException(ErrorType::INTERNAL_ERROR,
-                            "io_submit failed: " + std::to_string(submitted));
-    }
-
-    // Single io_getevents to wait for all completions.
-    std::vector<struct io_event> events(static_cast<uint64_t>(submitted));
-    int64_t num_events = 0;
-    while (num_events < submitted) {
-        auto ret = io_getevents(context->ctx_,
-                                static_cast<int64_t>(submitted - num_events),
-                                static_cast<int64_t>(submitted - num_events),
-                                events.data() + num_events,
-                                nullptr);
-        if (ret < 0) {
-            if (ret == -EINTR) {
-                continue;
-            }
-            io_context_pool->ReturnOne(context);
-            throw VsagException(ErrorType::INTERNAL_ERROR,
-                                "io_getevents failed: " + std::to_string(-ret));
-        }
-        num_events += ret;
-    }
-
     io_context_pool->ReturnOne(context);
     return true;
 }
