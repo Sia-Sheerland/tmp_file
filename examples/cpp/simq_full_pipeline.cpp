@@ -163,7 +163,7 @@ static std::string make_build_param(const std::string& mv_file_path,
            "\"metric_type\":\"ip\","
            "\"dim\":256,"
            "\"index_param\":{"
-           "\"base_io_type\":\"async_io\","
+           "\"base_io_type\":\"memory_io\","
            "\"base_file_path\":\"" + mv_file_path + "\","
            "\"init_cluster_ratio\":0.1,"
            "\"max_cluster_size\":160,"
