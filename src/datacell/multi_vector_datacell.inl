@@ -25,6 +25,10 @@
 #include "utils/byte_buffer.h"
 #include "vsag/options.h"
 
+#if HAVE_LIBAIO
+#include "io/async_io/async_io.h"
+#endif
+
 namespace vsag {
 
 template <typename QuantTmpl, typename IOTmpl>
@@ -287,38 +291,138 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
         sorted_idx[i] = idx[perm[i]];
     }
 
-    // Step 3: Batch read all data via MultiRead (async IO, now in offset-sorted order)
-    auto* all_codes = static_cast<uint8_t*>(this->allocator_->Allocate(total_size));
-    this->io_->MultiRead(all_codes,
-                         sorted_data_sizes.data(),
-                         sorted_offsets.data(),
-                         static_cast<uint64_t>(id_count));
-    double io_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_io_start).count();
+    // Step 3: Read data into per-doc aligned buffers.
+    //
+    // When IOTmpl is AsyncIO (libaio): use try_3_temp4-style path — single
+    // io_submit for the entire batch, no memcpy to a contiguous buffer.
+    // Compute reads directly from per-doc buffers. ~6-12ms faster than
+    // MultiReadImpl for typical rerank batches (2000-3000 docs).
+    //
+    // Otherwise: fall back to MultiRead with a contiguous all_codes buffer.
+    static constexpr int64_t DIO_ALIGN = 4096;
 
-    // Step 4: Compute MaxSim distances in sorted order → temp_dists
+    // Per-doc slot descriptor for the in-place async path.
+    struct Slot {
+        void* buffer;           ///< 4K-aligned buffer
+        uint64_t read_size;     ///< padded read size (4K multiple)
+        uint64_t prefix;        ///< bytes to skip at start (offset alignment)
+    };
+    std::vector<Slot> slots(static_cast<uint64_t>(id_count));
+
+    // Allocate per-doc aligned buffers
+    for (InnerIdType i = 0; i < id_count; ++i) {
+        const uint64_t offset = sorted_offsets[i];
+        const uint64_t data_size = sorted_data_sizes[i];
+
+        const int64_t aligned_off = (offset / DIO_ALIGN) * DIO_ALIGN;
+        const uint64_t prefix = offset - static_cast<uint64_t>(aligned_off);
+        const uint64_t read_size =
+            ((prefix + data_size + DIO_ALIGN - 1) / DIO_ALIGN) * DIO_ALIGN;
+
+        void* raw = nullptr;
+        if (::posix_memalign(&raw, static_cast<size_t>(DIO_ALIGN), static_cast<size_t>(read_size)) !=
+            0) {
+            slots[i] = {nullptr, 0, 0};
+            continue;
+        }
+        slots[i] = {raw, read_size, prefix};
+    }
+
+    double io_ms;
+#if HAVE_LIBAIO
+    if constexpr (std::is_same_v<IOTmpl, AsyncIO>) {
+        // try_3_temp4-style path: build AioSlots, single io_submit, no memcpy
+        std::vector<AsyncIO::AioSlot> aio_slots(static_cast<uint64_t>(id_count));
+        for (InnerIdType i = 0; i < id_count; ++i) {
+            aio_slots[i] = {
+                slots[i].buffer, slots[i].read_size, sorted_offsets[i] - slots[i].prefix};
+        }
+        auto* async_io = static_cast<AsyncIO*>(this->io_.get());
+        async_io->MultiReadInPlaceImpl(aio_slots.data(), static_cast<uint64_t>(id_count));
+        io_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_io_start)
+                    .count();
+    } else
+#endif
+    {
+        // Fallback: MultiRead into a contiguous all_codes buffer
+        auto* all_codes = static_cast<uint8_t*>(this->allocator_->Allocate(total_size));
+        this->io_->MultiRead(all_codes,
+                             sorted_data_sizes.data(),
+                             sorted_offsets.data(),
+                             static_cast<uint64_t>(id_count));
+        io_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_io_start)
+                    .count();
+
+        // Compute from all_codes (fallback path — kept for non-AsyncIO backends)
+        auto t_compute_start = std::chrono::steady_clock::now();
+        std::vector<float> temp_dists(static_cast<uint64_t>(id_count));
+        uint64_t cursor = 0;
+        for (InnerIdType i = 0; i < id_count; ++i) {
+            const uint32_t token_count = token_counts_[sorted_idx[i]];
+            mv_computer->ComputeDist(
+                all_codes + cursor + sizeof(uint32_t), token_count, &temp_dists[i]);
+            cursor += sorted_data_sizes[i];
+        }
+        for (InnerIdType i = 0; i < id_count; ++i) {
+            result_dists[perm[i]] = temp_dists[i];
+        }
+        double compute_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_compute_start)
+                                .count();
+
+        this->allocator_->Deallocate(all_codes);
+
+        // Free per-doc buffers (none were used in fallback, but free just in case)
+        for (InnerIdType i = 0; i < id_count; ++i) {
+            if (slots[i].buffer) {
+                std::free(slots[i].buffer);
+            }
+        }
+
+        if (stats != nullptr) {
+            stats->mv_io_time_ms.fetch_add(static_cast<uint32_t>(io_ms + 0.5),
+                                           std::memory_order_relaxed);
+            stats->mv_compute_time_ms.fetch_add(static_cast<uint32_t>(compute_ms + 0.5),
+                                                std::memory_order_relaxed);
+            stats->mv_candidate_count.fetch_add(static_cast<uint32_t>(id_count),
+                                                std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    // Step 4: Compute MaxSim distances from per-doc buffers (AsyncIO path)
     auto t_compute_start = std::chrono::steady_clock::now();
     std::vector<float> temp_dists(static_cast<uint64_t>(id_count));
-    uint64_t cursor = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
+        if (!slots[i].buffer) {
+            temp_dists[i] = std::numeric_limits<float>::max();
+            continue;
+        }
         const uint32_t token_count = token_counts_[sorted_idx[i]];
-        mv_computer->ComputeDist(
-            all_codes + cursor + sizeof(uint32_t), token_count, &temp_dists[i]);
-        cursor += sorted_data_sizes[i];
+        // Skip the 4-byte token_count prefix within the per-doc buffer
+        mv_computer->ComputeDist(static_cast<uint8_t*>(slots[i].buffer) + slots[i].prefix +
+                                     sizeof(uint32_t),
+                                 token_count,
+                                 &temp_dists[i]);
     }
 
     // Step 4.5: Unsort temp_dists back to the caller's original order.
-    //           result_dists[perm[i]] = temp_dists[i] places each distance
-    //           at the position matching the caller's idx[] array.
     for (InnerIdType i = 0; i < id_count; ++i) {
         result_dists[perm[i]] = temp_dists[i];
     }
     double compute_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_compute_start).count();
+                            std::chrono::steady_clock::now() - t_compute_start)
+                            .count();
 
-    this->allocator_->Deallocate(all_codes);
+    // Free per-doc buffers
+    for (InnerIdType i = 0; i < id_count; ++i) {
+        if (slots[i].buffer) {
+            std::free(slots[i].buffer);
+        }
+    }
 
-    // Populate SearchStatistics with fine-grained breakdown (rounded to ms)
     if (stats != nullptr) {
         stats->mv_io_time_ms.fetch_add(static_cast<uint32_t>(io_ms + 0.5),
                                        std::memory_order_relaxed);
