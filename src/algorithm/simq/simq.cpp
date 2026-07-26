@@ -658,12 +658,19 @@ SIMQ::coarse_search(const float* query_tokens,
                     int64_t coarse_k,
                     uint64_t* coarse_dist_cmp,
                     uint64_t* coarse_probe_count) const {
-    // All buffers are local — safe for concurrent searches under shared_lock.
-    std::unordered_map<InnerIdType, float> score_map;
-    score_map.reserve(static_cast<uint64_t>(coarse_k) * static_cast<uint64_t>(max_cluster_size_));
-    std::unordered_set<InnerIdType> seen_this_token;
-    seen_this_token.reserve(static_cast<uint64_t>(coarse_k) *
-                            static_cast<uint64_t>(max_cluster_size_));
+    // Flat-array fast-path (mirrors v4's integer scoring). Replaces the previous
+    // unordered_map<InnerIdType,float> score_map + unordered_set<InnerIdType>
+    // seen_this_token which dominated coarse-search latency (~50-100ns per op
+    // vs ~2ns for flat arrays).
+    //
+    // Buffers are reused across queries via mutable member state. Lazily grown
+    // to fit the current total_count_ on first call after Build/Add/Deserialize.
+    const auto n_docs = static_cast<size_t>(total_count_);
+    if (coarse_score_buf_.size() < n_docs) {
+        coarse_score_buf_.assign(n_docs, 0.0f);
+        coarse_seen_buf_.assign(n_docs, false);
+    }
+    coarse_dirty_.clear();
 
     for (uint32_t ti = 0; ti < query_token_count; ++ti) {
         const auto* qt = query_tokens + ti * dim_;
@@ -699,21 +706,42 @@ SIMQ::coarse_search(const float* query_tokens,
             return a.first > b.first;
         });
 
-        seen_this_token.clear();
-        for (auto& [cscore, cidx] : cscores) {
+        // Propagate cluster scores to docs via flat arrays (O(1) per doc).
+        // seen_buf_ dedups docs hit multiple times within the same query token
+        // (a doc can belong to several returned clusters).
+        // score_buf_ accumulates across all query tokens.
+        coarse_seen_dirty_.clear();
+        for (const auto& [cscore, cidx] : cscores) {
             if (cidx >= static_cast<InnerIdType>(num_clusters_)) {
                 continue;
             }
             for (InnerIdType doc_id : cluster_lists_[cidx]) {
-                if (!seen_this_token.insert(doc_id).second) {
-                    continue;
+                if (coarse_seen_buf_[doc_id]) {
+                    continue;  // already scored for this token
                 }
-                score_map[doc_id] += cscore;
+                coarse_seen_buf_[doc_id] = true;
+                coarse_seen_dirty_.push_back(doc_id);
+                if (coarse_score_buf_[doc_id] == 0.0f) {
+                    coarse_dirty_.push_back(doc_id);
+                }
+                coarse_score_buf_[doc_id] += cscore;
             }
+        }
+        // Reset per-token seen flags (only touched entries — O(k) not O(N))
+        for (InnerIdType doc_id : coarse_seen_dirty_) {
+            coarse_seen_buf_[doc_id] = false;
         }
     }
 
-    std::vector<std::pair<InnerIdType, float>> ranked(score_map.begin(), score_map.end());
+    // Collect survivors and reset score buffer for the next query.
+    std::vector<std::pair<InnerIdType, float>> ranked;
+    ranked.reserve(coarse_dirty_.size());
+    for (InnerIdType doc_id : coarse_dirty_) {
+        ranked.emplace_back(doc_id, coarse_score_buf_[doc_id]);
+        coarse_score_buf_[doc_id] = 0.0f;  // reset for next query
+    }
+    coarse_dirty_.clear();
+
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;
     });
