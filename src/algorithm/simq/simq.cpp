@@ -77,9 +77,9 @@ dump_simq_statistics(const SearchStatistics& stats,
     json["simq_coarse_ms"].SetDouble(coarse_ms);
     json["simq_query_ms"].SetDouble(query_ms);
     json["simq_sort_ms"].SetDouble(sort_ms);
-    json["simq_mv_io_ms"].SetUint(mv_io_ms);
-    json["simq_mv_compute_ms"].SetUint(mv_compute_ms);
-    json["simq_mv_candidates"].SetUint(mv_candidates);
+    json["simq_mv_io_ms"].SetInt(static_cast<int>(mv_io_ms));
+    json["simq_mv_compute_ms"].SetInt(static_cast<int>(mv_compute_ms));
+    json["simq_mv_candidates"].SetInt(static_cast<int>(mv_candidates));
     return json.Dump();
 }
 
