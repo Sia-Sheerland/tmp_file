@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <numeric>
 
 #include "common.h"
 #include "multi_vector_datacell.h"
@@ -266,23 +267,51 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
         total_size += data_sizes[i];
     }
 
-    // Step 3: Batch read all data via MultiRead (async IO)
+    // Step 2.5: Sort requests by disk offset for sequential IO (lever 3).
+    //           SSD schedulers handle sorted requests more efficiently, and
+    //           AsyncIO::MultiReadImpl can merge/schedule them better.
+    //           We build a permutation, reorder offsets/data_sizes accordingly,
+    //           then unsort the computed distances back to the caller's order.
+    std::vector<uint32_t> perm(static_cast<uint64_t>(id_count));
+    std::iota(perm.begin(), perm.end(), 0);
+    std::sort(perm.begin(), perm.end(), [&offsets](uint32_t a, uint32_t b) {
+        return offsets[a] < offsets[b];
+    });
+
+    std::vector<uint64_t> sorted_offsets(static_cast<uint64_t>(id_count));
+    std::vector<uint64_t> sorted_data_sizes(static_cast<uint64_t>(id_count));
+    std::vector<InnerIdType> sorted_idx(static_cast<uint64_t>(id_count));
+    for (InnerIdType i = 0; i < id_count; ++i) {
+        sorted_offsets[i] = offsets[perm[i]];
+        sorted_data_sizes[i] = data_sizes[perm[i]];
+        sorted_idx[i] = idx[perm[i]];
+    }
+
+    // Step 3: Batch read all data via MultiRead (async IO, now in offset-sorted order)
     auto* all_codes = static_cast<uint8_t*>(this->allocator_->Allocate(total_size));
     this->io_->MultiRead(all_codes,
-                         data_sizes.data(),
-                         offsets.data(),
+                         sorted_data_sizes.data(),
+                         sorted_offsets.data(),
                          static_cast<uint64_t>(id_count));
     double io_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_io_start).count();
 
-    // Step 4: Compute MaxSim distances
+    // Step 4: Compute MaxSim distances in sorted order → temp_dists
     auto t_compute_start = std::chrono::steady_clock::now();
+    std::vector<float> temp_dists(static_cast<uint64_t>(id_count));
     uint64_t cursor = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
-        const uint32_t token_count = token_counts_[idx[i]];
+        const uint32_t token_count = token_counts_[sorted_idx[i]];
         mv_computer->ComputeDist(
-            all_codes + cursor + sizeof(uint32_t), token_count, result_dists + i);
-        cursor += data_sizes[i];
+            all_codes + cursor + sizeof(uint32_t), token_count, &temp_dists[i]);
+        cursor += sorted_data_sizes[i];
+    }
+
+    // Step 4.5: Unsort temp_dists back to the caller's original order.
+    //           result_dists[perm[i]] = temp_dists[i] places each distance
+    //           at the position matching the caller's idx[] array.
+    for (InnerIdType i = 0; i < id_count; ++i) {
+        result_dists[perm[i]] = temp_dists[i];
     }
     double compute_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_compute_start).count();
