@@ -329,7 +329,7 @@ int main(int argc, char** argv) {
     std::vector<int> eval_ks = {10, 20, 50, 100};
 
     std::ofstream log(out_txt);
-    log << "coarse_k,avg_ms,qps,avg_nret,avg_coarse_ms,avg_query_ms,avg_sort_ms,avg_mv_io_ms,avg_mv_compute_ms,avg_mv_candidates,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
+    log << "coarse_k,avg_ms,qps,avg_nret,avg_coarse_ms,avg_query_ms,avg_sort_ms,avg_mv_io_ms,avg_mv_compute_ms,avg_mv_candidates,avg_iops,avg_bw_mb_s,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
 
     for (int ck : sweep) {
         std::string search_param = make_search_param(ck, rerank_full);
@@ -343,6 +343,7 @@ int main(int argc, char** argv) {
         double mv_io_ms_sum = 0.0;
         double mv_compute_ms_sum = 0.0;
         double mv_candidates_sum = 0.0;
+        double mv_io_bytes_sum = 0.0;
 
         for (int64_t qi = 0; qi < qnum; ++qi) {
             auto ds = vsag::Dataset::Make();
@@ -372,14 +373,16 @@ int main(int argc, char** argv) {
                                                       "simq_sort_ms",
                                                       "simq_mv_io_ms",
                                                       "simq_mv_compute_ms",
-                                                      "simq_mv_candidates"});
-            if (timing_vals.size() == 6) {
+                                                      "simq_mv_candidates",
+                                                      "mv_io_bytes"});
+            if (timing_vals.size() == 7) {
                 if (!timing_vals[0].empty()) coarse_ms_sum += std::stod(timing_vals[0]);
                 if (!timing_vals[1].empty()) query_ms_sum += std::stod(timing_vals[1]);
                 if (!timing_vals[2].empty()) sort_ms_sum += std::stod(timing_vals[2]);
                 if (!timing_vals[3].empty()) mv_io_ms_sum += std::stod(timing_vals[3]);
                 if (!timing_vals[4].empty()) mv_compute_ms_sum += std::stod(timing_vals[4]);
                 if (!timing_vals[5].empty()) mv_candidates_sum += std::stod(timing_vals[5]);
+                if (!timing_vals[6].empty()) mv_io_bytes_sum += std::stod(timing_vals[6]);
             }
 
             for (size_t ei = 0; ei < eval_ks.size(); ++ei) {
@@ -409,6 +412,12 @@ int main(int argc, char** argv) {
         double avg_mv_io_ms = mv_io_ms_sum / qnum;
         double avg_mv_compute_ms = mv_compute_ms_sum / qnum;
         double avg_mv_candidates = mv_candidates_sum / qnum;
+        double avg_iops = (mv_io_ms_sum > 0.0)
+                              ? mv_candidates_sum / (mv_io_ms_sum / 1000.0)
+                              : 0.0;
+        double avg_bw_mb_s = (mv_io_ms_sum > 0.0)
+                                 ? mv_io_bytes_sum / (mv_io_ms_sum / 1000.0) / 1e6
+                                 : 0.0;
 
         std::cout << "coarse=" << ck
                   << " avg_ms=" << avg_ms
@@ -420,6 +429,8 @@ int main(int argc, char** argv) {
                   << " mv_io=" << avg_mv_io_ms << "ms"
                   << " mv_compute=" << avg_mv_compute_ms << "ms"
                   << " mv_cands=" << avg_mv_candidates
+                  << " iops=" << avg_iops
+                  << " bw_mb_s=" << avg_bw_mb_s
                   << " r10=" << recall_sum[0] / qnum
                   << " r20=" << recall_sum[1] / qnum
                   << " r50=" << recall_sum[2] / qnum
@@ -436,6 +447,8 @@ int main(int argc, char** argv) {
             << avg_mv_io_ms << ","
             << avg_mv_compute_ms << ","
             << avg_mv_candidates << ","
+            << avg_iops << ","
+            << avg_bw_mb_s << ","
             << recall_sum[0] / qnum << ","
             << recall_sum[1] / qnum << ","
             << recall_sum[2] / qnum << ","
