@@ -145,3 +145,59 @@ coarse=50 avg_ms=12.3 qps=81.3 ... mv_cands=1234 iops=18500.3 bw_mb_s=512.7 r10=
 - [ ] 评估是否要加多线程 compute
 - [ ] 评估是否要改 chunking 策略
 - [ ] 评估是否要换内联 SIMD（但要避开上次的性能陷阱）
+
+## 6. 切换 SimQ 到纯内存搜索（MemoryIO）
+
+### 背景
+用户跑完了上一轮的 benchmark（AsyncIO 模式），决定切换到纯内存搜索，
+把 `mv_codes_` 的 IO 后端从 `AsyncIO`（磁盘 libaio）改为 `MemoryIO`（内存 buffer）。
+用户说"改动很小"。
+
+### 改动（commit `63b20165`，分支 `perf/coarse-search-flat-array`）
+
+3 个文件各改 1 行：
+
+| 文件 | 行 | 改动 |
+|------|------|------|
+| `src/algorithm/simq/simq.cpp` | 1131 | `SIMQ_PARAMS_TEMPLATE` 默认 IO 类型 `async_io` → `memory_io` |
+| `examples/cpp/simq_full_pipeline.cpp` | 166 | build param `base_io_type` `async_io` → `memory_io` |
+| `tests/test_simq.cpp` | 107 | test param `base_io_type` `async_io` → `memory_io` |
+
+### 原理
+
+- `MultiVectorDataCell` 的 `io_` 是模板参数，由参数 JSON 的 `io_params.type` 决定
+- `MemoryIO` 实现了与 `AsyncIO` 相同的接口（Read/Write/MultiRead/Resize/DirectRead）
+- MemoryIO 内部就是一个动态 buffer，所有操作都是 memcpy，无系统调用
+- `base_file_path` 参数保留但被 MemoryIO 忽略，不会报错
+- `offset_io_`（MemoryBlockIO）不受影响，本来就是内存
+
+### 预期效果
+
+- `mv_io` 从 ~25ms 降到接近 0（memcpy 代替 io_submit/io_getevents）
+- 查询耗时由 `mv_compute`（MaxSim 计算，单线程）主导
+- build 时数据全存 RAM；序列化后 index 文件包含全量向量数据
+- 旧的 AsyncIO index 无法 Deserialize，需要 rebuild
+
+### 服务器端编译运行
+
+```bash
+cd /workspace/tmp_file
+git pull origin perf/coarse-search-flat-array
+make release -j$(nproc)
+g++ -std=c++17 -O2 \
+    -I include -I /usr/include/hdf5/serial \
+    examples/cpp/simq_full_pipeline.cpp \
+    -L build-release/src -lvsag \
+    -L /usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 \
+    -lpthread -o /tmp/simq_full_new
+# 注意：必须用 rebuild 模式，旧的 async_io index 不兼容
+LD_LIBRARY_PATH=/workspace/tmp_file/build-release/src:$LD_LIBRARY_PATH \
+  stdbuf -oL /tmp/simq_full_new \
+    /dataset/multi_vec_20260513.hdf5 1000000 rebuild \
+  2>&1 | tee /tmp/simq_output.log
+```
+
+### 待办（更新）
+- [ ] 跑 rebuild benchmark，对比 MemoryIO 下的 QPS / mv_io / mv_compute
+- [ ] 如果 mv_compute 成为唯一瓶颈 → 加多线程 ComputeDist
+- [ ] 评估内存占用是否可接受（1M docs × 平均 8 tokens × 256 dim × 4B ≈ 8GB）
