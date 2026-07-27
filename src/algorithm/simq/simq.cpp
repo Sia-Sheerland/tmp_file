@@ -1128,7 +1128,7 @@ static const std::string SIMQ_PARAMS_TEMPLATE =
         "{TYPE_KEY}": "{INDEX_SIMQ}",
         "{BASE_CODES_KEY}": {
             "{IO_PARAMS_KEY}": {
-                "{TYPE_KEY}": "{IO_TYPE_VALUE_ASYNC_IO}",
+                "{TYPE_KEY}": "{IO_TYPE_VALUE_MEMORY_IO}",
                 "{IO_FILE_PATH_KEY}": "{DEFAULT_FILE_PATH_VALUE}"
             },
             "{CODES_TYPE_KEY}": "multi_vector"
