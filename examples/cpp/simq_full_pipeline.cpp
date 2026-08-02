@@ -214,8 +214,8 @@ int main(int argc, char** argv) {
     auto test = read_f32_2d(
         f, "test", 0, static_cast<hsize_t>(qtokens), static_cast<hsize_t>(dim));
 
-    int64_t rerank_full = base_docs;
-    std::string build_param = make_build_param(mv_file, rerank_full);
+    int64_t rerank_k = 1000;  // 候选文档数固定为 1000
+    std::string build_param = make_build_param(mv_file, rerank_k);
 
     bool need_build = (mode == "rebuild") || (!file_exists(index_file));
     if (mode == "load") need_build = false;
@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
     log << "coarse_k,avg_ms,qps,avg_nret,avg_coarse_ms,avg_query_ms,avg_sort_ms,avg_mv_io_ms,avg_mv_compute_ms,avg_mv_candidates,avg_iops,avg_bw_mb_s,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
 
     for (int ck : sweep) {
-        std::string search_param = make_search_param(ck, rerank_full);
+        std::string search_param = make_search_param(ck, rerank_k);
 
         double total_s = 0.0;
         std::vector<double> recall_sum(eval_ks.size(), 0.0);
