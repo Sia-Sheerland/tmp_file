@@ -826,12 +826,15 @@ SIMQ::flush_pending_splits() {
 void
 SIMQ::prepare_and_execute_splits(std::vector<SplitTask>& tasks) {
     // Pre-allocate space in cluster_lists_ and cluster_token_counts_
+    // Use push_back to add new slots (resize doesn't work with AllocatorWrapper)
     const int64_t new_cluster_count = static_cast<int64_t>(tasks.size());
-    cluster_lists_.resize(static_cast<uint64_t>(num_clusters_ + new_cluster_count));
-    cluster_token_counts_.resize(static_cast<uint64_t>(num_clusters_ + new_cluster_count), 0);
+    for (int64_t i = 0; i < new_cluster_count; ++i) {
+        cluster_lists_.push_back(Vector<InnerIdType>(allocator_));
+        cluster_token_counts_.push_back(0);
+    }
 
     // Execute splits in parallel using thread pool
-    if (this->thread_pool_ and this->thread_pool_->GetPoolSize() > 1) {
+    if (this->thread_pool_) {
         std::vector<std::future<void>> futures;
         futures.reserve(tasks.size());
 
@@ -883,7 +886,7 @@ SIMQ::execute_split_parallel(const SplitTask& task) {
         cluster_lists_[task.cluster_idx].push_back(doc_id);
     }
 
-    // 3. Build new cluster list
+    // 3. Build new cluster list (pre-allocated slot)
     cluster_lists_[task.new_cluster_idx].clear();
     for (InnerIdType doc_id : task.new_docs) {
         cluster_lists_[task.new_cluster_idx].push_back(doc_id);
@@ -894,88 +897,54 @@ SIMQ::execute_split_parallel(const SplitTask& task) {
     cluster_token_counts_[task.new_cluster_idx] = task.tokens.size() - task.half;
 
     // 5. Add new cluster representative to rep_hgraph_
-    // Note: HGraph::Add() has internal mutex, so concurrent calls are serialized
-    // but safe. We compute the new center from the moved tokens.
-    const uint64_t udim = static_cast<uint64_t>(common_param_.dim_);
-    std::vector<float> new_center(udim, 0.0F);
+    // Use the boundary token (closest to old center among new half) as new center
+    InnerIdType rep_tid = task.tokens[task.half];
+    InnerIdType rep_doc = token_to_doc_[rep_tid];
+    uint32_t rep_offset = token_to_offset_[rep_tid];
 
-    // Average the doc vectors in new_docs to get new center
-    for (InnerIdType doc_id : task.new_docs) {
-        bool need_release = false;
-        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
-        const uint32_t token_count = *reinterpret_cast<const uint32_t*>(codes);
-        const uint8_t* token_data = codes + sizeof(uint32_t);
-        const uint64_t code_size = mv_codes_->GetQuantizerCodeSize();
+    const auto udim = static_cast<uint64_t>(dim_);
+    const uint64_t code_size_per_token = mv_codes_->GetQuantizerCodeSize();
+    bool need_release = false;
+    const auto* codes = mv_codes_->GetCodesById(rep_doc, need_release);
 
-        // Decode and accumulate tokens
-        for (uint32_t t = 0; t < token_count; ++t) {
-            std::vector<float> decoded(udim);
-            // For now, assume FP32 quantizer (direct memcpy)
-            // TODO: Handle other quantizers properly
-            std::memcpy(decoded.data(),
-                        token_data + static_cast<uint64_t>(t) * udim * sizeof(float),
-                        udim * sizeof(float));
-            for (uint64_t d = 0; d < udim; ++d) {
-                new_center[d] += decoded[d];
-            }
-        }
+    std::vector<float> new_rep_vec(udim);
+    mv_codes_->Decode(codes + sizeof(uint32_t) +
+                          static_cast<uint64_t>(rep_offset) * code_size_per_token,
+                      new_rep_vec.data());
 
-        if (need_release) {
-            mv_codes_->ReleaseCodes(doc_id, codes);
-        }
+    if (need_release) {
+        mv_codes_->Release(codes);
     }
 
-    // Normalize by token count
-    uint64_t total_tokens = 0;
-    for (InnerIdType doc_id : task.new_docs) {
-        bool need_release = false;
-        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
-        total_tokens += *reinterpret_cast<const uint32_t*>(codes);
-        if (need_release) {
-            mv_codes_->ReleaseCodes(doc_id, codes);
-        }
-    }
-
-    if (total_tokens > 0) {
-        for (uint64_t d = 0; d < udim; ++d) {
-            new_center[d] /= static_cast<float>(total_tokens);
-        }
-    }
-
-    // Add to rep_hgraph_ (serialized by HGraph's internal mutex)
+    auto new_label = static_cast<int64_t>(task.new_cluster_idx);
     auto new_ds = Dataset::Make();
-    new_ds->Dim(common_param_.dim_)
-        ->NumElements(1)
-        ->FloatVectors(new_center.data())
+    new_ds->NumElements(1)
+        ->Dim(dim_)
+        ->Float32Vectors(new_rep_vec.data())
+        ->Ids(&new_label)
         ->Owner(false);
     rep_hgraph_->Add(new_ds);
 
-    // 6. Update token_to_dist_ for moved tokens (recompute distance to new center)
+    // 6. Update token_to_dist_ for moved tokens (recompute distance to new representative)
+    std::vector<float> decoded_token(udim);
     for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
         InnerIdType tid = task.tokens[rank];
         InnerIdType doc_id = token_to_doc_[tid];
         uint32_t offset = token_to_offset_[tid];
+        bool nr = false;
+        const auto* c = mv_codes_->GetCodesById(doc_id, nr);
+        mv_codes_->Decode(c + sizeof(uint32_t) +
+                              static_cast<uint64_t>(offset) * code_size_per_token,
+                          decoded_token.data());
 
-        // Get the token vector
-        bool need_release = false;
-        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
-        const uint8_t* token_data = codes + sizeof(uint32_t);
-        const uint64_t code_size = mv_codes_->GetQuantizerCodeSize();
-
-        std::vector<float> token_vec(common_param_.dim_);
-        // Assume FP32 for now
-        std::memcpy(token_vec.data(),
-                    token_data + static_cast<uint64_t>(offset) * code_size,
-                    static_cast<uint64_t>(common_param_.dim_) * sizeof(float));
-
-        if (need_release) {
-            mv_codes_->ReleaseCodes(doc_id, codes);
+        if (nr) {
+            mv_codes_->Release(c);
         }
 
-        // Compute distance to new center (IP distance = 1 - dot product)
+        // Compute IP distance: 1 - dot(new_rep, token)
         float dot = 0.0F;
-        for (int64_t d = 0; d < common_param_.dim_; ++d) {
-            dot += token_vec[d] * new_center[d];
+        for (uint64_t d = 0; d < udim; ++d) {
+            dot += new_rep_vec[d] * decoded_token[d];
         }
         token_to_dist_[tid] = 1.0F - dot;
     }
