@@ -266,17 +266,71 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
 
     build_hgraph(init_centers, dim);
 
-    for (auto it = all_indices.begin() + num_init; it != all_indices.end(); ++it) {
-        int vid = *it;
-        int nearest = find_nearest_cluster(vid);
-        float dist = ip_distance(vid, nearest);
+    // Batch parallel token assignment
+    const int64_t batch_size = 10000;  // Process 10k tokens per batch
+    const int64_t num_threads = static_cast<int64_t>(common_param_.thread_pool_
+        ? common_param_.thread_pool_->GetPoolSize()
+        : 1);
 
-        sorted_insert(clusters_[nearest], static_cast<InnerIdType>(vid), dist);
-        vec_to_cluster_[vid] = nearest;
+    auto remaining_it = all_indices.begin() + num_init;
 
-        if (static_cast<int>(clusters_[nearest].size()) > max_cluster_size_) {
-            split_cluster(nearest, dim);
+    while (remaining_it != all_indices.end()) {
+        // Determine batch range
+        auto batch_end = remaining_it;
+        int64_t count = 0;
+        while (batch_end != all_indices.end() && count < batch_size) {
+            ++batch_end;
+            ++count;
         }
+
+        if (count == 0) break;
+
+        // Parallel phase: find nearest cluster for all tokens in batch
+        std::vector<std::pair<int, int>> batch_assignments(count);  // (vid, nearest_cid)
+
+        if (num_threads > 1 && count > 100) {
+            std::vector<std::future<void>> futures;
+            const int64_t chunk_size = (count + num_threads - 1) / num_threads;
+
+            for (int64_t t = 0; t < num_threads; ++t) {
+                const int64_t start = t * chunk_size;
+                const int64_t end = std::min(start + chunk_size, count);
+                if (start >= count) break;
+
+                futures.push_back(common_param_.thread_pool_->GeneralEnqueue(
+                    [&, t, start, end]() {
+                        for (int64_t i = start; i < end; ++i) {
+                            int vid = *(remaining_it + i);
+                            int nearest = find_nearest_cluster(vid);
+                            batch_assignments[i] = {vid, nearest};
+                        }
+                    }));
+            }
+
+            for (auto& f : futures) {
+                f.get();
+            }
+        } else {
+            // Serial fallback for small batches
+            for (int64_t i = 0; i < count; ++i) {
+                int vid = *(remaining_it + i);
+                int nearest = find_nearest_cluster(vid);
+                batch_assignments[i] = {vid, nearest};
+            }
+        }
+
+        // Serial phase: apply assignments and check for splits
+        for (const auto& [vid, nearest] : batch_assignments) {
+            float dist = ip_distance(vid, nearest);
+            sorted_insert(clusters_[nearest], static_cast<InnerIdType>(vid), dist);
+            vec_to_cluster_[vid] = nearest;
+
+            if (static_cast<int>(clusters_[nearest].size()) > max_cluster_size_) {
+                split_cluster(nearest, dim);
+            }
+        }
+
+        remaining_it = batch_end;
     }
 }
 
