@@ -55,7 +55,7 @@ SIMQParameter::FromJson(const JsonType& json) {
         rerank_k = json[SIMQ_RERANK_K].GetInt();
     }
     if (json.Contains(SIMQ_SPLIT_DELAY_SECONDS)) {
-        split_delay_seconds = json[SIMQ_SPLIT_DELAY_SECONDS].GetDouble();
+        split_delay_seconds = json[SIMQ_SPLIT_DELAY_SECONDS].GetFloat();
     }
     if (json.Contains(SIMQ_QUANTIZATION_TYPE)) {
         quantization_type = json[SIMQ_QUANTIZATION_TYPE].GetString();
