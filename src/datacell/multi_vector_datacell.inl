@@ -329,7 +329,9 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
                 decoded_tokens.data() +
                     static_cast<uint64_t>(t) * static_cast<uint64_t>(multi_vector_dim_));
         }
-        mv_computer->ComputeDist(decoded_tokens.data(), token_count, &temp_dists[i]);
+        mv_computer->ComputeDist(reinterpret_cast<const uint8_t*>(decoded_tokens.data()),
+                                 token_count,
+                                 &temp_dists[i]);
         cursor += sorted_data_sizes[i];
     }
 
