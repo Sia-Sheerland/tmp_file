@@ -68,12 +68,22 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::InsertVector(const void* vector, InnerId
         }
     }
 
-    const uint64_t vector_bytes = static_cast<uint64_t>(multi_vector->len_) *
-                                  static_cast<uint64_t>(multi_vector_dim_) * sizeof(float);
-    const uint64_t code_size = sizeof(uint32_t) + vector_bytes;
+    const uint64_t code_size_per_token = this->quantizer_->GetCodeSize();
+    const uint64_t payload_bytes =
+        static_cast<uint64_t>(multi_vector->len_) * code_size_per_token;
+    const uint64_t code_size = sizeof(uint32_t) + payload_bytes;
     ByteBuffer codes(code_size, allocator_);
     std::memcpy(codes.data, &multi_vector->len_, sizeof(uint32_t));
-    std::memcpy(codes.data + sizeof(uint32_t), multi_vector->vectors_, vector_bytes);
+
+    // Encode each token through the quantizer (FP32Quantizer is a no-op memcpy)
+    for (uint32_t t = 0; t < multi_vector->len_; ++t) {
+        const float* token_vec =
+            multi_vector->vectors_ +
+            static_cast<uint64_t>(t) * static_cast<uint64_t>(multi_vector_dim_);
+        this->quantizer_->EncodeOne(token_vec,
+                                    codes.data + sizeof(uint32_t) +
+                                        static_cast<uint64_t>(t) * code_size_per_token);
+    }
 
     uint64_t old_offset = 0;
     {
@@ -148,8 +158,9 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::GetCodesById(InnerIdType id, bool& need_
     offset_io_->Read(sizeof(offset), static_cast<uint64_t>(id) * sizeof(offset), (uint8_t*)&offset);
     uint32_t len = 0;
     io_->Read(sizeof(len), offset, (uint8_t*)&len);
+    const uint64_t code_size_per_token = this->quantizer_->GetCodeSize();
     uint64_t read_size =
-        sizeof(uint32_t) + static_cast<uint64_t>(len) * multi_vector_dim_ * sizeof(float);
+        sizeof(uint32_t) + static_cast<uint64_t>(len) * code_size_per_token;
     auto* codes = static_cast<uint8_t*>(allocator_->Allocate(read_size));
     io_->Read(read_size, offset, codes);
     need_release = true;
@@ -258,12 +269,13 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
 
     // Step 2: Look up token counts from in-memory cache (no disk IO)
     //         Populated by InsertVector (Build) or rebuilt in Deserialize.
+    const uint64_t code_size_per_token = this->quantizer_->GetCodeSize();
     std::vector<uint64_t> data_sizes(id_count);
     uint64_t total_size = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
         const uint32_t token_count = token_counts_[idx[i]];
         data_sizes[i] = sizeof(uint32_t) +
-                        static_cast<uint64_t>(token_count) * multi_vector_dim_ * sizeof(float);
+                        static_cast<uint64_t>(token_count) * code_size_per_token;
         total_size += data_sizes[i];
     }
 
@@ -299,11 +311,25 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
     // Step 4: Compute MaxSim distances in sorted order → temp_dists
     auto t_compute_start = std::chrono::steady_clock::now();
     std::vector<float> temp_dists(static_cast<uint64_t>(id_count));
+    // Decode buffer: one doc at a time (reused across iterations)
+    std::vector<float> decoded_tokens;
     uint64_t cursor = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
         const uint32_t token_count = token_counts_[sorted_idx[i]];
-        mv_computer->ComputeDist(
-            all_codes + cursor + sizeof(uint32_t), token_count, &temp_dists[i]);
+        const uint8_t* encoded = all_codes + cursor + sizeof(uint32_t);
+
+        // Decode quantized tokens back to float32 for ComputeDist.
+        // For FP32Quantizer this is a no-op memcpy; for SQ8/FP16 it performs
+        // the actual dequantization.
+        decoded_tokens.resize(static_cast<uint64_t>(token_count) *
+                              static_cast<uint64_t>(multi_vector_dim_));
+        for (uint32_t t = 0; t < token_count; ++t) {
+            this->quantizer_->DecodeOne(
+                encoded + static_cast<uint64_t>(t) * code_size_per_token,
+                decoded_tokens.data() +
+                    static_cast<uint64_t>(t) * static_cast<uint64_t>(multi_vector_dim_));
+        }
+        mv_computer->ComputeDist(decoded_tokens.data(), token_count, &temp_dists[i]);
         cursor += sorted_data_sizes[i];
     }
 

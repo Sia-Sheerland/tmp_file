@@ -101,6 +101,21 @@ template <MetricType metric, typename IOTemp>
 static FlattenInterfacePtr
 make_instance(const FlattenInterfaceParamPtr& param, const IndexCommonParam& common_param) {
     if (param->name == MULTI_VECTOR_DATA_CELL) {
+        auto qtype = param->quantizer_parameter->GetTypeName();
+        if (qtype == QUANTIZATION_TYPE_VALUE_FP16) {
+            return make_instance_multi_vector<FP16Quantizer<metric>, IOTemp>(param, common_param);
+        }
+        if (qtype == QUANTIZATION_TYPE_VALUE_BF16) {
+            return make_instance_multi_vector<BF16Quantizer<metric>, IOTemp>(param, common_param);
+        }
+        if (qtype == QUANTIZATION_TYPE_VALUE_SQ8_UNIFORM) {
+            return make_instance_multi_vector<SQ8UniformQuantizer<metric>, IOTemp>(param,
+                                                                                  common_param);
+        }
+        if (qtype == QUANTIZATION_TYPE_VALUE_INT8) {
+            return make_instance_multi_vector<INT8Quantizer<metric>, IOTemp>(param, common_param);
+        }
+        // Default: FP32 (no compression)
         return make_instance_multi_vector<FP32Quantizer<metric>, IOTemp>(param, common_param);
     }
 

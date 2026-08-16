@@ -15,7 +15,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <shared_mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "algorithm/hgraph/hgraph.h"
@@ -112,6 +115,9 @@ private:
     void
     split_cluster_incremental(InnerIdType cluster_idx);
 
+    void
+    flush_pending_splits();
+
 private:
     IndexCommonParam common_param_;
     int64_t num_clusters_{0};
@@ -132,6 +138,17 @@ private:
 
     // Per-cluster token count for O(1) split threshold check during Add
     Vector<uint64_t> cluster_token_counts_;
+
+    // Clusters that exceeded max_cluster_size_ but haven't been split yet.
+    // Accumulated during Add() and processed in batch by flush_pending_splits().
+    std::unordered_set<InnerIdType> pending_splits_;
+
+    // For each cluster in pending_splits_, the time point at which it first
+    // exceeded the threshold (used together with split_delay_seconds_).
+    std::unordered_map<InnerIdType, std::chrono::steady_clock::time_point>
+        pending_split_first_overflow_;
+
+    double split_delay_seconds_{0.0};
 
     float init_cluster_ratio_{0.2f};
     int64_t max_cluster_size_{64};

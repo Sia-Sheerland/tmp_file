@@ -157,7 +157,10 @@ static vsag::BinarySet load_binary_set(const std::string& path) {
 }
 
 static std::string make_build_param(const std::string& mv_file_path,
-                                    int64_t rerank_k_default) {
+                                    int64_t rerank_k_default,
+                                    int64_t build_thread_count = 1,
+                                    double split_delay_seconds = 0.0,
+                                    const std::string& quantization_type = "fp32") {
     return "{"
            "\"dtype\":\"float32\","
            "\"metric_type\":\"ip\","
@@ -169,7 +172,10 @@ static std::string make_build_param(const std::string& mv_file_path,
            "\"max_cluster_size\":160,"
            "\"split_start_idx\":80,"
            "\"coarse_k\":50,"
-           "\"rerank_k\":" + std::to_string(rerank_k_default) +
+           "\"rerank_k\":" + std::to_string(rerank_k_default) + ","
+           "\"build_thread_count\":" + std::to_string(build_thread_count) + ","
+           "\"split_delay_seconds\":" + std::to_string(split_delay_seconds) + ","
+           "\"quantization_type\":\"" + quantization_type + "\""
            "}}";
 }
 
@@ -181,18 +187,25 @@ static std::string make_search_param(int coarse_k, int64_t rerank_k) {
 int main(int argc, char** argv) {
     std::string h5_path = "/dataset/multi_vec_20260513.hdf5";
     int64_t base_docs = 1000000;
-    std::string mode = "auto";  // auto | rebuild | load
+    std::string mode = "auto";           // auto | rebuild | load
+    int64_t build_threads = 1;           // parallel build thread count
+    double split_delay = 0.0;            // seconds to wait before split (0 = immediate)
+    std::string quant_type = "fp32";     // fp32 | fp16 | bf16 | sq8_uniform | int8
 
     const int dim = 256;
     const int search_topk = 100;
 
-    const std::string index_file = "/tmp/simq_index.bin";
-    const std::string mv_file = "/tmp/simq_mv_codes.bin";
-    const std::string out_txt = "/tmp/simq_eval.txt";
-
     if (argc >= 2) h5_path = argv[1];
     if (argc >= 3) base_docs = std::atoll(argv[2]);
     if (argc >= 4) mode = argv[3];
+    if (argc >= 5) build_threads = std::atoll(argv[4]);
+    if (argc >= 6) split_delay = std::atof(argv[5]);
+    if (argc >= 7) quant_type = argv[6];
+
+    // 文件名带量化类型后缀，方便保留多个索引
+    const std::string index_file = "/tmp/simq_index_" + quant_type + ".bin";
+    const std::string mv_file = "/tmp/simq_mv_codes_" + quant_type + ".bin";
+    const std::string out_txt = "/tmp/simq_eval_" + quant_type + ".txt";
 
     hid_t f = H5Fopen(h5_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     if (f < 0) throw std::runtime_error("failed to open hdf5: " + h5_path);
@@ -215,7 +228,8 @@ int main(int argc, char** argv) {
         f, "test", 0, static_cast<hsize_t>(qtokens), static_cast<hsize_t>(dim));
 
     int64_t rerank_k = 1000;  // 候选文档数固定为 1000
-    std::string build_param = make_build_param(mv_file, rerank_k);
+    std::string build_param =
+        make_build_param(mv_file, rerank_k, build_threads, split_delay, quant_type);
 
     bool need_build = (mode == "rebuild") || (!file_exists(index_file));
     if (mode == "load") need_build = false;
