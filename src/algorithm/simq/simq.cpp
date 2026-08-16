@@ -818,8 +818,8 @@ SIMQ::Add(const DatasetPtr& data) {
 void
 SIMQ::flush_pending_splits() {
     // Three-phase parallel split:
-    // Phase 1 (serial): Determine which clusters to split, prepare tasks
-    // Phase 2 (parallel): Execute splits concurrently
+    // Phase 1 (serial): Determine which clusters to split, collect tokens in one pass O(N)
+    // Phase 2 (parallel): Execute splits concurrently (inter-cluster parallelism)
     // Phase 3 (serial): Finalize counters and check for re-split
 
     auto now = std::chrono::steady_clock::now();
@@ -827,114 +827,96 @@ SIMQ::flush_pending_splits() {
     const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::duration<double>(split_delay_seconds_));
 
-    bool progress = true;
-    while (progress and not pending_splits_.empty()) {
-        progress = false;
-        std::unordered_set<InnerIdType> deferred;
-        std::vector<SplitTask> tasks;
+    // ── Phase 1: Serial preparation with O(N) token collection ─────────────
+    // First, determine which clusters need splitting and assign new_cluster_idx
+    std::unordered_set<InnerIdType> clusters_to_split;
+    std::unordered_map<InnerIdType, int64_t> cluster_to_task_idx;
+    std::vector<SplitTask> tasks;
 
-        // ── Phase 1: Serial preparation ────────────────────────────────────
-        for (InnerIdType cluster_idx : pending_splits_) {
-            // Skip if the cluster has been invalidated
-            if (cluster_idx >= static_cast<InnerIdType>(cluster_token_counts_.size())) {
-                pending_split_first_overflow_.erase(cluster_idx);
-                continue;
-            }
-            if (static_cast<int64_t>(cluster_token_counts_[cluster_idx]) <= max_cluster_size_) {
-                pending_split_first_overflow_.erase(cluster_idx);
-                continue;
-            }
-
-            // Check delay timer
-            auto ts_it = pending_split_first_overflow_.find(cluster_idx);
-            if (ts_it == pending_split_first_overflow_.end()) {
-                pending_split_first_overflow_[cluster_idx] = now;
-                ts_it = pending_split_first_overflow_.find(cluster_idx);
-            }
-
-            if (immediate or (now - ts_it->second) >= delay) {
-                // Collect tokens for this cluster
-                SplitTask task;
-                task.cluster_idx = cluster_idx;
-                task.new_cluster_idx = static_cast<InnerIdType>(num_clusters_ + tasks.size());
-
-                // ── Parallel token collection ───────────────────────────────
-                // Scan vec_to_cluster_ in parallel to find all tokens in this cluster
-                const uint64_t total_tokens = vec_to_cluster_.size();
-                const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
-                const uint64_t chunk_size = (total_tokens + num_threads - 1) / num_threads;
-
-                if (this->thread_pool_ && total_tokens > 10000) {
-                    // Parallel path: partition scan across threads
-                    std::vector<std::future<std::vector<InnerIdType>>> futures;
-                    futures.reserve(static_cast<size_t>(num_threads));
-
-                    for (int64_t t = 0; t < num_threads; ++t) {
-                        const uint64_t start = static_cast<uint64_t>(t) * chunk_size;
-                        const uint64_t end = std::min(start + chunk_size, total_tokens);
-                        if (start >= total_tokens) break;
-
-                        futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
-                            std::vector<InnerIdType> local_tokens;
-                            for (uint64_t ti = start; ti < end; ++ti) {
-                                if (vec_to_cluster_[ti] == cluster_idx) {
-                                    local_tokens.push_back(static_cast<InnerIdType>(ti));
-                                }
-                            }
-                            return local_tokens;
-                        }));
-                    }
-
-                    // Merge results from all threads
-                    for (auto& future : futures) {
-                        auto local_tokens = future.get();
-                        task.tokens.insert(task.tokens.end(), local_tokens.begin(), local_tokens.end());
-                    }
-                } else {
-                    // Serial fallback
-                    for (uint64_t ti = 0; ti < total_tokens; ++ti) {
-                        if (vec_to_cluster_[ti] == cluster_idx) {
-                            task.tokens.push_back(static_cast<InnerIdType>(ti));
-                        }
-                    }
-                }
-
-                uint64_t n = task.tokens.size();
-                if (n < 2) {
-                    continue;  // Nothing to split
-                }
-
-                // Sort by distance (ascending = closer first)
-                std::sort(task.tokens.begin(), task.tokens.end(), [this](InnerIdType a, InnerIdType b) {
-                    return token_to_dist_[a] < token_to_dist_[b];
-                });
-
-                task.half = n / 2;
-
-                // Partition docs into old/new sets
-                for (uint64_t rank = 0; rank < n; ++rank) {
-                    InnerIdType tid = task.tokens[rank];
-                    if (rank < task.half) {
-                        task.old_docs.insert(token_to_doc_[tid]);
-                    } else {
-                        task.new_docs.insert(token_to_doc_[tid]);
-                    }
-                }
-
-                tasks.push_back(std::move(task));
-                progress = true;
-            } else {
-                deferred.insert(cluster_idx);
-            }
+    std::unordered_set<InnerIdType> deferred;
+    for (InnerIdType cluster_idx : pending_splits_) {
+        // Skip if the cluster has been invalidated
+        if (cluster_idx >= static_cast<InnerIdType>(cluster_token_counts_.size())) {
+            pending_split_first_overflow_.erase(cluster_idx);
+            continue;
+        }
+        if (static_cast<int64_t>(cluster_token_counts_[cluster_idx]) <= max_cluster_size_) {
+            pending_split_first_overflow_.erase(cluster_idx);
+            continue;
         }
 
-        // ── Phase 2: Parallel execution ────────────────────────────────────
-        if (not tasks.empty()) {
-            prepare_and_execute_splits(tasks);
+        // Check delay timer
+        auto ts_it = pending_split_first_overflow_.find(cluster_idx);
+        if (ts_it == pending_split_first_overflow_.end()) {
+            pending_split_first_overflow_[cluster_idx] = now;
+            ts_it = pending_split_first_overflow_.find(cluster_idx);
         }
 
-        pending_splits_ = std::move(deferred);
+        if (immediate or (now - ts_it->second) >= delay) {
+            clusters_to_split.insert(cluster_idx);
+            cluster_to_task_idx[cluster_idx] = static_cast<int64_t>(tasks.size());
+
+            SplitTask task;
+            task.cluster_idx = cluster_idx;
+            task.new_cluster_idx = static_cast<InnerIdType>(num_clusters_ + tasks.size());
+            tasks.push_back(std::move(task));
+        } else {
+            deferred.insert(cluster_idx);
+        }
     }
+
+    if (clusters_to_split.empty()) {
+        pending_splits_ = std::move(deferred);
+        return;
+    }
+
+    // One-pass token collection: O(N) instead of O(K*N)
+    const uint64_t total_tokens = vec_to_cluster_.size();
+    for (uint64_t ti = 0; ti < total_tokens; ++ti) {
+        InnerIdType cluster_idx = vec_to_cluster_[ti];
+        auto it = clusters_to_split.find(cluster_idx);
+        if (it != clusters_to_split.end()) {
+            int64_t task_idx = cluster_to_task_idx[cluster_idx];
+            tasks[task_idx].tokens.push_back(static_cast<InnerIdType>(ti));
+        }
+    }
+
+    // Sort and partition for each task
+    for (auto& task : tasks) {
+        uint64_t n = task.tokens.size();
+        if (n < 2) {
+            continue;  // Nothing to split
+        }
+
+        // Sort by distance (ascending = closer first)
+        std::sort(task.tokens.begin(), task.tokens.end(), [this](InnerIdType a, InnerIdType b) {
+            return token_to_dist_[a] < token_to_dist_[b];
+        });
+
+        task.half = n / 2;
+
+        // Partition docs into old/new sets
+        for (uint64_t rank = 0; rank < n; ++rank) {
+            InnerIdType tid = task.tokens[rank];
+            if (rank < task.half) {
+                task.old_docs.insert(token_to_doc_[tid]);
+            } else {
+                task.new_docs.insert(token_to_doc_[tid]);
+            }
+        }
+    }
+
+    // Remove tasks with nothing to split
+    tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+                                [](const SplitTask& t) { return t.tokens.size() < 2; }),
+                tasks.end());
+
+    // ── Phase 2: Parallel execution (inter-cluster parallelism) ────────────
+    if (not tasks.empty()) {
+        prepare_and_execute_splits(tasks);
+    }
+
+    pending_splits_ = std::move(deferred);
 }
 
 void
@@ -1040,71 +1022,28 @@ SIMQ::execute_split_parallel(const SplitTask& task) {
     rep_hgraph_->Add(new_ds);
 
     // 6. Update token_to_dist_ for moved tokens (recompute distance to new representative)
-    // Parallelize this loop since each token's distance computation is independent
-    const uint64_t num_moved = task.tokens.size() - task.half;
-    if (this->thread_pool_ && num_moved > 100) {
-        // Parallel path: partition moved tokens across threads
-        const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
-        const uint64_t chunk_size = (num_moved + num_threads - 1) / num_threads;
+    // Serial computation (inter-cluster parallelism is handled in prepare_and_execute_splits)
+    std::vector<float> decoded_token(udim);
+    for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
+        InnerIdType tid = task.tokens[rank];
+        InnerIdType doc_id = token_to_doc_[tid];
+        uint32_t offset = token_to_offset_[tid];
+        bool nr = false;
+        const auto* c = mv_codes_->GetCodesById(doc_id, nr);
+        mv_codes_->Decode(c + sizeof(uint32_t) +
+                              static_cast<uint64_t>(offset) * code_size_per_token,
+                          decoded_token.data());
 
-        std::vector<std::future<void>> futures;
-        futures.reserve(static_cast<size_t>(num_threads));
-
-        for (int64_t t = 0; t < num_threads; ++t) {
-            const uint64_t start = static_cast<uint64_t>(t) * chunk_size;
-            const uint64_t end = std::min(start + chunk_size, num_moved);
-            if (start >= num_moved) break;
-
-            futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
-                std::vector<float> local_decoded(udim);
-                for (uint64_t rank = task.half + start; rank < task.half + end; ++rank) {
-                    InnerIdType tid = task.tokens[rank];
-                    InnerIdType doc_id = token_to_doc_[tid];
-                    uint32_t offset = token_to_offset_[tid];
-                    bool nr = false;
-                    const auto* c = mv_codes_->GetCodesById(doc_id, nr);
-                    mv_codes_->Decode(c + sizeof(uint32_t) +
-                                          static_cast<uint64_t>(offset) * code_size_per_token,
-                                      local_decoded.data());
-
-                    if (nr) {
-                        mv_codes_->Release(c);
-                    }
-
-                    // Compute IP distance: 1 - dot(new_rep, token)
-                    float dot = 0.0F;
-                    for (uint64_t d = 0; d < udim; ++d) {
-                        dot += new_rep_vec[d] * local_decoded[d];
-                    }
-                    token_to_dist_[tid] = 1.0F - dot;
-                }
-            }));
+        if (nr) {
+            mv_codes_->Release(c);
         }
-        wait_all_futures(futures);
-    } else {
-        // Serial fallback
-        std::vector<float> decoded_token(udim);
-        for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
-            InnerIdType tid = task.tokens[rank];
-            InnerIdType doc_id = token_to_doc_[tid];
-            uint32_t offset = token_to_offset_[tid];
-            bool nr = false;
-            const auto* c = mv_codes_->GetCodesById(doc_id, nr);
-            mv_codes_->Decode(c + sizeof(uint32_t) +
-                                  static_cast<uint64_t>(offset) * code_size_per_token,
-                              decoded_token.data());
 
-            if (nr) {
-                mv_codes_->Release(c);
-            }
-
-            // Compute IP distance: 1 - dot(new_rep, token)
-            float dot = 0.0F;
-            for (uint64_t d = 0; d < udim; ++d) {
-                dot += new_rep_vec[d] * decoded_token[d];
-            }
-            token_to_dist_[tid] = 1.0F - dot;
+        // Compute IP distance: 1 - dot(new_rep, token)
+        float dot = 0.0F;
+        for (uint64_t d = 0; d < udim; ++d) {
+            dot += new_rep_vec[d] * decoded_token[d];
         }
+        token_to_dist_[tid] = 1.0F - dot;
     }
 }
 
