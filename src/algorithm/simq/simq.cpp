@@ -272,7 +272,7 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
 
     // Batch parallel token assignment
     const int64_t batch_size = 10000;  // Process 10k tokens per batch
-    const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
+    const int64_t num_threads = common_param_.thread_pool_ ? 32 : 1;  // Use 32 threads if thread pool exists
 
     auto remaining_it = all_indices.begin() + num_init;
 
