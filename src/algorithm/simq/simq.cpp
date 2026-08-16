@@ -431,48 +431,128 @@ SIMQ::run_clustering(const float* flat_vecs,
 
 void
 SIMQ::build_rep_hgraph(const float* flat_vecs, int64_t dim) {
-    // Build per-cluster token member lists
+    // ── Parallel token grouping ──────────────────────────────────────────────
+    // Build per-cluster token member lists using per-thread buffers
     std::vector<std::vector<int>> cluster_token_members(static_cast<uint64_t>(num_clusters_));
-    for (int64_t v = 0; v < static_cast<int64_t>(vec_to_cluster_.size()); ++v) {
-        cluster_token_members[vec_to_cluster_[v]].push_back(static_cast<int>(v));
+
+    const int64_t num_tokens = static_cast<int64_t>(vec_to_cluster_.size());
+    const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
+    const int64_t chunk_size = (num_tokens + num_threads - 1) / num_threads;
+
+    if (this->thread_pool_ && num_tokens > 1000) {
+        // Parallel path: partition tokens across threads
+        std::vector<std::future<void>> futures;
+        for (int64_t t = 0; t < num_threads; ++t) {
+            const int64_t start = t * chunk_size;
+            const int64_t end = std::min(start + chunk_size, num_tokens);
+            if (start >= num_tokens) break;
+
+            futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
+                // Per-thread local buffers to avoid contention
+                std::vector<std::vector<int>> local_members(static_cast<uint64_t>(num_clusters_));
+                for (int64_t v = start; v < end; ++v) {
+                    local_members[vec_to_cluster_[v]].push_back(static_cast<int>(v));
+                }
+                // Merge local buffers into global (sequential but fast)
+                for (int64_t c = 0; c < num_clusters_; ++c) {
+                    auto& global = cluster_token_members[static_cast<uint64_t>(c)];
+                    auto& local = local_members[static_cast<uint64_t>(c)];
+                    global.insert(global.end(), local.begin(), local.end());
+                }
+            }));
+        }
+        wait_all_futures(futures);
+    } else {
+        // Serial fallback
+        for (int64_t v = 0; v < num_tokens; ++v) {
+            cluster_token_members[vec_to_cluster_[v]].push_back(static_cast<int>(v));
+        }
     }
 
+    // ── Parallel representative computation ───────────────────────────────────
     // For each cluster pick the token vector closest to the cluster centroid
     std::vector<float> rep_vecs(static_cast<uint64_t>(num_clusters_) * static_cast<uint64_t>(dim));
     std::vector<int64_t> labels(static_cast<uint64_t>(num_clusters_));
 
-    for (int64_t idx = 0; idx < num_clusters_; ++idx) {
-        auto& members = cluster_token_members[static_cast<uint64_t>(idx)];
-        auto* dst = rep_vecs.data() + idx * dim;
-        // Label is the sequential cluster index so coarse_search IDs map directly
-        labels[static_cast<uint64_t>(idx)] = idx;
+    if (this->thread_pool_ && num_clusters_ > 10) {
+        // Parallel path: process clusters concurrently
+        std::vector<std::future<void>> futures;
+        for (int64_t idx = 0; idx < num_clusters_; ++idx) {
+            futures.push_back(this->thread_pool_->GeneralEnqueue([&, idx]() {
+                auto& members = cluster_token_members[static_cast<uint64_t>(idx)];
+                auto* dst = rep_vecs.data() + idx * dim;
+                labels[static_cast<uint64_t>(idx)] = idx;
 
-        if (members.empty()) {
-            std::memset(dst, 0, static_cast<uint64_t>(dim) * sizeof(float));
-            continue;
-        }
+                if (members.empty()) {
+                    std::memset(dst, 0, static_cast<uint64_t>(dim) * sizeof(float));
+                    return;
+                }
 
-        std::vector<float> mean(static_cast<uint64_t>(dim), 0.0F);
-        for (int vid : members) {
-            const auto* v = flat_vecs + vid * dim;
-            for (int d = 0; d < dim; ++d) {
-                mean[static_cast<uint64_t>(d)] += v[d];
-            }
+                // Compute mean vector
+                std::vector<float> mean(static_cast<uint64_t>(dim), 0.0F);
+                for (int vid : members) {
+                    const auto* v = flat_vecs + vid * dim;
+                    for (int d = 0; d < dim; ++d) {
+                        mean[static_cast<uint64_t>(d)] += v[d];
+                    }
+                }
+                const float inv_count = 1.0F / static_cast<float>(members.size());
+                for (int d = 0; d < dim; ++d) {
+                    mean[static_cast<uint64_t>(d)] *= inv_count;
+                }
+
+                // Find best token (closest to mean)
+                float best_dot = -1e30F;
+                int best_vid = members[0];
+                for (int vid : members) {
+                    const auto* v = flat_vecs + vid * dim;
+                    float dot = 0.0F;
+                    for (int d = 0; d < dim; ++d) {
+                        dot += v[d] * mean[static_cast<uint64_t>(d)];
+                    }
+                    if (dot > best_dot) {
+                        best_dot = dot;
+                        best_vid = vid;
+                    }
+                }
+                std::memcpy(dst, flat_vecs + best_vid * dim, static_cast<uint64_t>(dim) * sizeof(float));
+            }));
         }
-        float best_dot = -1e30F;
-        int best_vid = members[0];
-        for (int vid : members) {
-            const auto* v = flat_vecs + vid * dim;
-            float dot = 0.0F;
-            for (int d = 0; d < dim; ++d) {
-                dot += v[d] * mean[static_cast<uint64_t>(d)];
+        wait_all_futures(futures);
+    } else {
+        // Serial fallback
+        for (int64_t idx = 0; idx < num_clusters_; ++idx) {
+            auto& members = cluster_token_members[static_cast<uint64_t>(idx)];
+            auto* dst = rep_vecs.data() + idx * dim;
+            labels[static_cast<uint64_t>(idx)] = idx;
+
+            if (members.empty()) {
+                std::memset(dst, 0, static_cast<uint64_t>(dim) * sizeof(float));
+                continue;
             }
-            if (dot > best_dot) {
-                best_dot = dot;
-                best_vid = vid;
+
+            std::vector<float> mean(static_cast<uint64_t>(dim), 0.0F);
+            for (int vid : members) {
+                const auto* v = flat_vecs + vid * dim;
+                for (int d = 0; d < dim; ++d) {
+                    mean[static_cast<uint64_t>(d)] += v[d];
+                }
             }
+            float best_dot = -1e30F;
+            int best_vid = members[0];
+            for (int vid : members) {
+                const auto* v = flat_vecs + vid * dim;
+                float dot = 0.0F;
+                for (int d = 0; d < dim; ++d) {
+                    dot += v[d] * mean[static_cast<uint64_t>(d)];
+                }
+                if (dot > best_dot) {
+                    best_dot = dot;
+                    best_vid = vid;
+                }
+            }
+            std::memcpy(dst, flat_vecs + best_vid * dim, static_cast<uint64_t>(dim) * sizeof(float));
         }
-        std::memcpy(dst, flat_vecs + best_vid * dim, static_cast<uint64_t>(dim) * sizeof(float));
     }
 
     IndexCommonParam cp = common_param_;
@@ -778,10 +858,44 @@ SIMQ::flush_pending_splits() {
                 task.cluster_idx = cluster_idx;
                 task.new_cluster_idx = static_cast<InnerIdType>(num_clusters_ + tasks.size());
 
-                // Collect all tokens in this cluster
-                for (uint64_t ti = 0; ti < vec_to_cluster_.size(); ++ti) {
-                    if (vec_to_cluster_[ti] == cluster_idx) {
-                        task.tokens.push_back(static_cast<InnerIdType>(ti));
+                // ── Parallel token collection ───────────────────────────────
+                // Scan vec_to_cluster_ in parallel to find all tokens in this cluster
+                const uint64_t total_tokens = vec_to_cluster_.size();
+                const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
+                const uint64_t chunk_size = (total_tokens + num_threads - 1) / num_threads;
+
+                if (this->thread_pool_ && total_tokens > 10000) {
+                    // Parallel path: partition scan across threads
+                    std::vector<std::future<std::vector<InnerIdType>>> futures;
+                    futures.reserve(static_cast<size_t>(num_threads));
+
+                    for (int64_t t = 0; t < num_threads; ++t) {
+                        const uint64_t start = static_cast<uint64_t>(t) * chunk_size;
+                        const uint64_t end = std::min(start + chunk_size, total_tokens);
+                        if (start >= total_tokens) break;
+
+                        futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
+                            std::vector<InnerIdType> local_tokens;
+                            for (uint64_t ti = start; ti < end; ++ti) {
+                                if (vec_to_cluster_[ti] == cluster_idx) {
+                                    local_tokens.push_back(static_cast<InnerIdType>(ti));
+                                }
+                            }
+                            return local_tokens;
+                        }));
+                    }
+
+                    // Merge results from all threads
+                    for (auto& future : futures) {
+                        auto local_tokens = future.get();
+                        task.tokens.insert(task.tokens.end(), local_tokens.begin(), local_tokens.end());
+                    }
+                } else {
+                    // Serial fallback
+                    for (uint64_t ti = 0; ti < total_tokens; ++ti) {
+                        if (vec_to_cluster_[ti] == cluster_idx) {
+                            task.tokens.push_back(static_cast<InnerIdType>(ti));
+                        }
                     }
                 }
 
@@ -926,27 +1040,71 @@ SIMQ::execute_split_parallel(const SplitTask& task) {
     rep_hgraph_->Add(new_ds);
 
     // 6. Update token_to_dist_ for moved tokens (recompute distance to new representative)
-    std::vector<float> decoded_token(udim);
-    for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
-        InnerIdType tid = task.tokens[rank];
-        InnerIdType doc_id = token_to_doc_[tid];
-        uint32_t offset = token_to_offset_[tid];
-        bool nr = false;
-        const auto* c = mv_codes_->GetCodesById(doc_id, nr);
-        mv_codes_->Decode(c + sizeof(uint32_t) +
-                              static_cast<uint64_t>(offset) * code_size_per_token,
-                          decoded_token.data());
+    // Parallelize this loop since each token's distance computation is independent
+    const uint64_t num_moved = task.tokens.size() - task.half;
+    if (this->thread_pool_ && num_moved > 100) {
+        // Parallel path: partition moved tokens across threads
+        const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
+        const uint64_t chunk_size = (num_moved + num_threads - 1) / num_threads;
 
-        if (nr) {
-            mv_codes_->Release(c);
-        }
+        std::vector<std::future<void>> futures;
+        futures.reserve(static_cast<size_t>(num_threads));
 
-        // Compute IP distance: 1 - dot(new_rep, token)
-        float dot = 0.0F;
-        for (uint64_t d = 0; d < udim; ++d) {
-            dot += new_rep_vec[d] * decoded_token[d];
+        for (int64_t t = 0; t < num_threads; ++t) {
+            const uint64_t start = static_cast<uint64_t>(t) * chunk_size;
+            const uint64_t end = std::min(start + chunk_size, num_moved);
+            if (start >= num_moved) break;
+
+            futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
+                std::vector<float> local_decoded(udim);
+                for (uint64_t rank = task.half + start; rank < task.half + end; ++rank) {
+                    InnerIdType tid = task.tokens[rank];
+                    InnerIdType doc_id = token_to_doc_[tid];
+                    uint32_t offset = token_to_offset_[tid];
+                    bool nr = false;
+                    const auto* c = mv_codes_->GetCodesById(doc_id, nr);
+                    mv_codes_->Decode(c + sizeof(uint32_t) +
+                                          static_cast<uint64_t>(offset) * code_size_per_token,
+                                      local_decoded.data());
+
+                    if (nr) {
+                        mv_codes_->Release(c);
+                    }
+
+                    // Compute IP distance: 1 - dot(new_rep, token)
+                    float dot = 0.0F;
+                    for (uint64_t d = 0; d < udim; ++d) {
+                        dot += new_rep_vec[d] * local_decoded[d];
+                    }
+                    token_to_dist_[tid] = 1.0F - dot;
+                }
+            }));
         }
-        token_to_dist_[tid] = 1.0F - dot;
+        wait_all_futures(futures);
+    } else {
+        // Serial fallback
+        std::vector<float> decoded_token(udim);
+        for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
+            InnerIdType tid = task.tokens[rank];
+            InnerIdType doc_id = token_to_doc_[tid];
+            uint32_t offset = token_to_offset_[tid];
+            bool nr = false;
+            const auto* c = mv_codes_->GetCodesById(doc_id, nr);
+            mv_codes_->Decode(c + sizeof(uint32_t) +
+                                  static_cast<uint64_t>(offset) * code_size_per_token,
+                              decoded_token.data());
+
+            if (nr) {
+                mv_codes_->Release(c);
+            }
+
+            // Compute IP distance: 1 - dot(new_rep, token)
+            float dot = 0.0F;
+            for (uint64_t d = 0; d < udim; ++d) {
+                dot += new_rep_vec[d] * decoded_token[d];
+            }
+            token_to_dist_[tid] = 1.0F - dot;
+        }
     }
 }
 
@@ -1089,46 +1247,109 @@ SIMQ::coarse_search(const float* query_tokens,
     }
     coarse_dirty_.clear();
 
-    for (uint32_t ti = 0; ti < query_token_count; ++ti) {
-        const auto* qt = query_tokens + ti * dim_;
+    // ── Parallel KnnSearch for all query tokens ─────────────────────────────
+    // Each query token's search is independent. We do all KnnSearch calls in
+    // parallel, then sequentially propagate scores (which is fast O(k) per token).
+    struct TokenSearchResult {
+        std::vector<std::pair<float, InnerIdType>> cscores;
+        int64_t actual_coarse_k{0};
+        uint64_t dist_cmp{0};
+    };
+    std::vector<TokenSearchResult> token_results(query_token_count);
 
-        int64_t actual_coarse_k = std::min(coarse_k, num_clusters_);
-        if (actual_coarse_k <= 0) {
+    if (this->thread_pool_ && query_token_count > 1) {
+        // Parallel path: search all tokens concurrently
+        std::vector<std::future<void>> futures;
+        futures.reserve(query_token_count);
+
+        for (uint32_t ti = 0; ti < query_token_count; ++ti) {
+            futures.push_back(this->thread_pool_->GeneralEnqueue([&, ti]() {
+                const auto* qt = query_tokens + ti * dim_;
+                auto& result = token_results[ti];
+
+                result.actual_coarse_k = std::min(coarse_k, num_clusters_);
+                if (result.actual_coarse_k <= 0) {
+                    return;
+                }
+
+                auto query_ds = Dataset::Make();
+                query_ds->NumElements(1)->Dim(dim_)->Float32Vectors(qt)->Owner(false);
+                auto result_ds = rep_hgraph_->KnnSearch(
+                    query_ds, result.actual_coarse_k, R"({"hgraph": {"ef_search": 100}})", nullptr);
+
+                if (coarse_dist_cmp != nullptr) {
+                    result.dist_cmp = read_dist_cmp(result_ds);
+                }
+
+                int64_t nres = result_ds->GetDim();
+                const auto* rdists = result_ds->GetDistances();
+                const int64_t* rids = result_ds->GetIds();
+
+                result.cscores.reserve(static_cast<uint64_t>(nres));
+                for (int64_t ri = 0; ri < nres; ++ri) {
+                    float cscore = 1.0F - rdists[ri];
+                    auto cidx = static_cast<InnerIdType>(rids[ri]);
+                    result.cscores.emplace_back(cscore, cidx);
+                }
+                std::sort(result.cscores.begin(), result.cscores.end(), [](const auto& a, const auto& b) {
+                    return a.first > b.first;
+                });
+            }));
+        }
+        wait_all_futures(futures);
+    } else {
+        // Serial fallback
+        for (uint32_t ti = 0; ti < query_token_count; ++ti) {
+            const auto* qt = query_tokens + ti * dim_;
+            auto& result = token_results[ti];
+
+            result.actual_coarse_k = std::min(coarse_k, num_clusters_);
+            if (result.actual_coarse_k <= 0) {
+                continue;
+            }
+
+            auto query_ds = Dataset::Make();
+            query_ds->NumElements(1)->Dim(dim_)->Float32Vectors(qt)->Owner(false);
+            auto result_ds = rep_hgraph_->KnnSearch(
+                query_ds, result.actual_coarse_k, R"({"hgraph": {"ef_search": 100}})", nullptr);
+
+            if (coarse_dist_cmp != nullptr) {
+                result.dist_cmp = read_dist_cmp(result_ds);
+            }
+
+            int64_t nres = result_ds->GetDim();
+            const auto* rdists = result_ds->GetDistances();
+            const int64_t* rids = result_ds->GetIds();
+
+            result.cscores.reserve(static_cast<uint64_t>(nres));
+            for (int64_t ri = 0; ri < nres; ++ri) {
+                float cscore = 1.0F - rdists[ri];
+                auto cidx = static_cast<InnerIdType>(rids[ri]);
+                result.cscores.emplace_back(cscore, cidx);
+            }
+            std::sort(result.cscores.begin(), result.cscores.end(), [](const auto& a, const auto& b) {
+                return a.first > b.first;
+            });
+        }
+    }
+
+    // ── Sequential score propagation ────────────────────────────────────────
+    // Now merge all per-token results into the shared score buffers.
+    for (uint32_t ti = 0; ti < query_token_count; ++ti) {
+        const auto& result = token_results[ti];
+        if (result.actual_coarse_k <= 0) {
             continue;
         }
         if (coarse_probe_count != nullptr) {
-            *coarse_probe_count += static_cast<uint64_t>(actual_coarse_k);
+            *coarse_probe_count += static_cast<uint64_t>(result.actual_coarse_k);
         }
-
-        auto query_ds = Dataset::Make();
-        query_ds->NumElements(1)->Dim(dim_)->Float32Vectors(qt)->Owner(false);
-        auto result_ds = rep_hgraph_->KnnSearch(
-            query_ds, actual_coarse_k, R"({"hgraph": {"ef_search": 100}})", nullptr);
         if (coarse_dist_cmp != nullptr) {
-            *coarse_dist_cmp += read_dist_cmp(result_ds);
+            *coarse_dist_cmp += result.dist_cmp;
         }
-
-        int64_t nres = result_ds->GetDim();
-        const auto* rdists = result_ds->GetDistances();
-        const int64_t* rids = result_ds->GetIds();
-
-        std::vector<std::pair<float, InnerIdType>> cscores;
-        cscores.reserve(static_cast<uint64_t>(nres));
-        for (int64_t ri = 0; ri < nres; ++ri) {
-            float cscore = 1.0F - rdists[ri];
-            auto cidx = static_cast<InnerIdType>(rids[ri]);
-            cscores.emplace_back(cscore, cidx);
-        }
-        std::sort(cscores.begin(), cscores.end(), [](const auto& a, const auto& b) {
-            return a.first > b.first;
-        });
 
         // Propagate cluster scores to docs via flat arrays (O(1) per doc).
-        // seen_buf_ dedups docs hit multiple times within the same query token
-        // (a doc can belong to several returned clusters).
-        // score_buf_ accumulates across all query tokens.
         coarse_seen_dirty_.clear();
-        for (const auto& [cscore, cidx] : cscores) {
+        for (const auto& [cscore, cidx] : result.cscores) {
             if (cidx >= static_cast<InnerIdType>(num_clusters_)) {
                 continue;
             }
@@ -1144,7 +1365,7 @@ SIMQ::coarse_search(const float* query_tokens,
                 coarse_score_buf_[doc_id] += cscore;
             }
         }
-        // Reset per-token seen flags (only touched entries — O(k) not O(N))
+        // Reset per-token seen flags
         for (InnerIdType doc_id : coarse_seen_dirty_) {
             coarse_seen_buf_[doc_id] = false;
         }
