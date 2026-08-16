@@ -107,11 +107,13 @@ public:
                             int64_t max_cluster_size,
                             int64_t split_start_idx,
                             int64_t random_seed,
+                            int64_t build_thread_count,
                             IndexCommonParam common_param)
         : init_cluster_ratio_(init_cluster_ratio),
           max_cluster_size_(static_cast<int>(max_cluster_size)),
           split_start_idx_(static_cast<int>(split_start_idx)),
           random_seed_(static_cast<int>(random_seed)),
+          build_thread_count_(build_thread_count),
           common_param_(std::move(common_param)) {
     }
 
@@ -144,6 +146,7 @@ private:
     int max_cluster_size_;
     int split_start_idx_;
     int random_seed_;
+    int64_t build_thread_count_;
     IndexCommonParam common_param_;
 
     const float* vecs_{nullptr};
@@ -272,7 +275,7 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
 
     // Batch parallel token assignment
     const int64_t batch_size = 10000;  // Process 10k tokens per batch
-    const int64_t num_threads = common_param_.thread_pool_ ? 32 : 1;  // Use 32 threads if thread pool exists
+    const int64_t num_threads = build_thread_count_;
 
     auto remaining_it = all_indices.begin() + num_init;
 
@@ -439,7 +442,7 @@ SIMQ::run_clustering(const float* flat_vecs,
                      int64_t num_vecs,
                      int64_t dim) {
     HGraphDynamicClustering clustering(
-        init_cluster_ratio_, max_cluster_size_, split_start_idx_, random_seed_, common_param_);
+        init_cluster_ratio_, max_cluster_size_, split_start_idx_, random_seed_, build_thread_count_, common_param_);
     clustering.Fit(flat_vecs, num_vecs, dim);
 
     auto nc = static_cast<int64_t>(clustering.cluster_centers_.size());
