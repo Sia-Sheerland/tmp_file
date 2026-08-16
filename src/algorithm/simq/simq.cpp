@@ -897,8 +897,8 @@ SIMQ::execute_split_parallel(const SplitTask& task) {
     cluster_token_counts_[task.new_cluster_idx] = task.tokens.size() - task.half;
 
     // 5. Add new cluster representative to rep_hgraph_
-    // Use the boundary token (closest to old center among new half) as new center
-    InnerIdType rep_tid = task.tokens[task.half];
+    // Use the farthest token (from old center) in the new half as new center
+    InnerIdType rep_tid = task.tokens[task.tokens.size() - 1];
     InnerIdType rep_doc = token_to_doc_[rep_tid];
     uint32_t rep_offset = token_to_offset_[rep_tid];
 
