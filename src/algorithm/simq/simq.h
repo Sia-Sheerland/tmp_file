@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <shared_mutex>
 #include <unordered_map>
@@ -31,6 +32,16 @@
 #include "utils/pointer_define.h"
 
 namespace vsag {
+
+// Pre-allocated split task for parallel execution
+struct SplitTask {
+    InnerIdType cluster_idx;           // Cluster to split
+    InnerIdType new_cluster_idx;       // Pre-assigned new cluster index
+    std::vector<InnerIdType> tokens;   // All tokens in the cluster (sorted by distance)
+    uint64_t half;                     // Median split position
+    std::unordered_set<InnerIdType> old_docs;  // Docs staying in old cluster
+    std::unordered_set<InnerIdType> new_docs;  // Docs moving to new cluster
+};
 
 class SIMQ : public InnerIndexInterface {
 public:
@@ -118,9 +129,23 @@ private:
     void
     flush_pending_splits();
 
+    // Parallel split execution
+    void
+    execute_split_parallel(const SplitTask& task);
+
+    void
+    prepare_and_execute_splits(std::vector<SplitTask>& tasks);
+
 private:
     IndexCommonParam common_param_;
     int64_t num_clusters_{0};
+
+    // Progress tracking for Add() operation
+    std::atomic<uint64_t> add_completed_docs_{0};
+    std::atomic<uint64_t> add_completed_tokens_{0};
+    uint64_t add_total_docs_{0};
+    uint64_t add_total_tokens_{0};
+    int last_reported_pct_{-1};
 
     // Per-cluster doc-ID lists; mutable for incremental Add.
     Vector<Vector<InnerIdType>> cluster_lists_;

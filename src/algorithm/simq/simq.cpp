@@ -29,6 +29,7 @@
 #include <utility>
 
 #include "dataset_impl.h"
+#include "impl/logger/logger.h"
 #include "index_feature_list.h"
 #include "inner_string_params.h"
 #include "metric_type.h"
@@ -583,6 +584,13 @@ SIMQ::Add(const DatasetPtr& data) {
     const uint64_t udim = static_cast<uint64_t>(dim_);
     bool use_parallel = this->thread_pool_ != nullptr and num_docs > 1;
 
+    // Initialize progress tracking
+    add_completed_docs_.store(0, std::memory_order_relaxed);
+    add_completed_tokens_.store(0, std::memory_order_relaxed);
+    add_total_docs_ = static_cast<uint64_t>(num_docs);
+    add_total_tokens_ = total_new_tokens;
+    last_reported_pct_ = -1;
+
     if (use_parallel) {
         Vector<PerThreadClusterData> per_thread(num_docs, allocator_);
         std::vector<std::future<void>> futures;
@@ -624,6 +632,23 @@ SIMQ::Add(const DatasetPtr& data) {
                             td.cluster_docs[cluster_idx].push_back(inner_id);
                         }
                         td.cluster_token_contrib[cluster_idx]++;
+                    }
+
+                    // Update progress counters
+                    add_completed_docs_.fetch_add(1, std::memory_order_relaxed);
+                    add_completed_tokens_.fetch_add(mvs[i].len_, std::memory_order_relaxed);
+
+                    // Report progress at 10% intervals
+                    uint64_t completed = add_completed_docs_.load(std::memory_order_relaxed);
+                    int pct = static_cast<int>(100.0 * completed / add_total_docs_);
+                    if (pct > last_reported_pct_) {
+                        last_reported_pct_ = pct;
+                        logger::info("[SIMQ Add] Progress: {}% ({}/{} docs, {}/{} tokens)",
+                                     pct,
+                                     completed,
+                                     add_total_docs_,
+                                     add_completed_tokens_.load(std::memory_order_relaxed),
+                                     add_total_tokens_);
                     }
                 }));
         }
@@ -682,6 +707,23 @@ SIMQ::Add(const DatasetPtr& data) {
                     pending_splits_.insert(cluster_idx);
                 }
             }
+
+            // Update progress counters
+            add_completed_docs_.fetch_add(1, std::memory_order_relaxed);
+            add_completed_tokens_.fetch_add(mvs[i].len_, std::memory_order_relaxed);
+
+            // Report progress at 10% intervals
+            uint64_t completed = add_completed_docs_.load(std::memory_order_relaxed);
+            int pct = static_cast<int>(100.0 * completed / add_total_docs_);
+            if (pct > last_reported_pct_) {
+                last_reported_pct_ = pct;
+                logger::info("[SIMQ Add] Progress: {}% ({}/{} docs, {}/{} tokens)",
+                             pct,
+                             completed,
+                             add_total_docs_,
+                             add_completed_tokens_.load(std::memory_order_relaxed),
+                             add_total_tokens_);
+            }
         }
     }
 
@@ -695,11 +737,11 @@ SIMQ::Add(const DatasetPtr& data) {
 
 void
 SIMQ::flush_pending_splits() {
-    // Process splits in rounds.  When split_delay_seconds_ > 0 a cluster is
-    // only split once it has been overflowing for at least that many seconds;
-    // otherwise it stays in pending_splits_ for the next flush.
-    // split_delay_seconds_ == 0 (default) behaves like the original code:
-    // split immediately.
+    // Three-phase parallel split:
+    // Phase 1 (serial): Determine which clusters to split, prepare tasks
+    // Phase 2 (parallel): Execute splits concurrently
+    // Phase 3 (serial): Finalize counters and check for re-split
+
     auto now = std::chrono::steady_clock::now();
     const bool immediate = split_delay_seconds_ <= 0.0;
     const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -709,36 +751,233 @@ SIMQ::flush_pending_splits() {
     while (progress and not pending_splits_.empty()) {
         progress = false;
         std::unordered_set<InnerIdType> deferred;
+        std::vector<SplitTask> tasks;
 
+        // ── Phase 1: Serial preparation ────────────────────────────────────
         for (InnerIdType cluster_idx : pending_splits_) {
-            // Skip if the cluster has been invalidated (e.g. count reset to 0)
+            // Skip if the cluster has been invalidated
             if (cluster_idx >= static_cast<InnerIdType>(cluster_token_counts_.size())) {
                 pending_split_first_overflow_.erase(cluster_idx);
                 continue;
             }
             if (static_cast<int64_t>(cluster_token_counts_[cluster_idx]) <= max_cluster_size_) {
-                // Under budget now — clear its overflow timestamp
                 pending_split_first_overflow_.erase(cluster_idx);
                 continue;
             }
 
-            // Still over the limit — check whether enough time has elapsed
+            // Check delay timer
             auto ts_it = pending_split_first_overflow_.find(cluster_idx);
             if (ts_it == pending_split_first_overflow_.end()) {
-                // First time we see this overflow in a flush; record timestamp
                 pending_split_first_overflow_[cluster_idx] = now;
                 ts_it = pending_split_first_overflow_.find(cluster_idx);
             }
 
             if (immediate or (now - ts_it->second) >= delay) {
-                split_cluster_incremental(cluster_idx);
+                // Collect tokens for this cluster
+                SplitTask task;
+                task.cluster_idx = cluster_idx;
+                task.new_cluster_idx = static_cast<InnerIdType>(num_clusters_ + tasks.size());
+
+                // Collect all tokens in this cluster
+                for (uint64_t ti = 0; ti < vec_to_cluster_.size(); ++ti) {
+                    if (vec_to_cluster_[ti] == cluster_idx) {
+                        task.tokens.push_back(static_cast<InnerIdType>(ti));
+                    }
+                }
+
+                uint64_t n = task.tokens.size();
+                if (n < 2) {
+                    continue;  // Nothing to split
+                }
+
+                // Sort by distance (ascending = closer first)
+                std::sort(task.tokens.begin(), task.tokens.end(), [this](InnerIdType a, InnerIdType b) {
+                    return token_to_dist_[a] < token_to_dist_[b];
+                });
+
+                task.half = n / 2;
+
+                // Partition docs into old/new sets
+                for (uint64_t rank = 0; rank < n; ++rank) {
+                    InnerIdType tid = task.tokens[rank];
+                    if (rank < task.half) {
+                        task.old_docs.insert(token_to_doc_[tid]);
+                    } else {
+                        task.new_docs.insert(token_to_doc_[tid]);
+                    }
+                }
+
+                tasks.push_back(std::move(task));
                 progress = true;
             } else {
                 deferred.insert(cluster_idx);
             }
         }
 
+        // ── Phase 2: Parallel execution ────────────────────────────────────
+        if (not tasks.empty()) {
+            prepare_and_execute_splits(tasks);
+        }
+
         pending_splits_ = std::move(deferred);
+    }
+}
+
+void
+SIMQ::prepare_and_execute_splits(std::vector<SplitTask>& tasks) {
+    // Pre-allocate space in cluster_lists_ and cluster_token_counts_
+    const int64_t new_cluster_count = static_cast<int64_t>(tasks.size());
+    cluster_lists_.resize(static_cast<uint64_t>(num_clusters_ + new_cluster_count));
+    cluster_token_counts_.resize(static_cast<uint64_t>(num_clusters_ + new_cluster_count), 0);
+
+    // Execute splits in parallel using thread pool
+    if (this->thread_pool_ and this->thread_pool_->GetPoolSize() > 1) {
+        std::vector<std::future<void>> futures;
+        futures.reserve(tasks.size());
+
+        for (const auto& task : tasks) {
+            futures.push_back(this->thread_pool_->GeneralEnqueue([this, &task]() {
+                execute_split_parallel(task);
+            }));
+        }
+
+        wait_all_futures(futures);
+    } else {
+        // Single-threaded fallback
+        for (const auto& task : tasks) {
+            execute_split_parallel(task);
+        }
+    }
+
+    // ── Phase 3: Serial finalization ───────────────────────────────────────
+    // Update num_clusters_ once
+    num_clusters_ += new_cluster_count;
+
+    // Check if either half still exceeds limit and re-queue
+    for (const auto& task : tasks) {
+        // Clear overflow timestamp for split cluster
+        pending_split_first_overflow_.erase(task.cluster_idx);
+
+        // Check old cluster
+        if (cluster_token_counts_[task.cluster_idx] > static_cast<uint64_t>(max_cluster_size_)) {
+            pending_splits_.insert(task.cluster_idx);
+        }
+        // Check new cluster
+        if (cluster_token_counts_[task.new_cluster_idx] > static_cast<uint64_t>(max_cluster_size_)) {
+            pending_splits_.insert(task.new_cluster_idx);
+        }
+    }
+}
+
+void
+SIMQ::execute_split_parallel(const SplitTask& task) {
+    // 1. Update vec_to_cluster_ for tokens moving to new cluster
+    for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
+        InnerIdType tid = task.tokens[rank];
+        vec_to_cluster_[tid] = task.new_cluster_idx;
+    }
+
+    // 2. Rebuild cluster_lists_ for old cluster
+    cluster_lists_[task.cluster_idx].clear();
+    for (InnerIdType doc_id : task.old_docs) {
+        cluster_lists_[task.cluster_idx].push_back(doc_id);
+    }
+
+    // 3. Build new cluster list
+    cluster_lists_[task.new_cluster_idx].clear();
+    for (InnerIdType doc_id : task.new_docs) {
+        cluster_lists_[task.new_cluster_idx].push_back(doc_id);
+    }
+
+    // 4. Update token counts
+    cluster_token_counts_[task.cluster_idx] = task.half;
+    cluster_token_counts_[task.new_cluster_idx] = task.tokens.size() - task.half;
+
+    // 5. Add new cluster representative to rep_hgraph_
+    // Note: HGraph::Add() has internal mutex, so concurrent calls are serialized
+    // but safe. We compute the new center from the moved tokens.
+    const uint64_t udim = static_cast<uint64_t>(common_param_.dim_);
+    std::vector<float> new_center(udim, 0.0F);
+
+    // Average the doc vectors in new_docs to get new center
+    for (InnerIdType doc_id : task.new_docs) {
+        bool need_release = false;
+        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
+        const uint32_t token_count = *reinterpret_cast<const uint32_t*>(codes);
+        const uint8_t* token_data = codes + sizeof(uint32_t);
+        const uint64_t code_size = mv_codes_->GetQuantizerCodeSize();
+
+        // Decode and accumulate tokens
+        for (uint32_t t = 0; t < token_count; ++t) {
+            std::vector<float> decoded(udim);
+            // For now, assume FP32 quantizer (direct memcpy)
+            // TODO: Handle other quantizers properly
+            std::memcpy(decoded.data(),
+                        token_data + static_cast<uint64_t>(t) * udim * sizeof(float),
+                        udim * sizeof(float));
+            for (uint64_t d = 0; d < udim; ++d) {
+                new_center[d] += decoded[d];
+            }
+        }
+
+        if (need_release) {
+            mv_codes_->ReleaseCodes(doc_id, codes);
+        }
+    }
+
+    // Normalize by token count
+    uint64_t total_tokens = 0;
+    for (InnerIdType doc_id : task.new_docs) {
+        bool need_release = false;
+        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
+        total_tokens += *reinterpret_cast<const uint32_t*>(codes);
+        if (need_release) {
+            mv_codes_->ReleaseCodes(doc_id, codes);
+        }
+    }
+
+    if (total_tokens > 0) {
+        for (uint64_t d = 0; d < udim; ++d) {
+            new_center[d] /= static_cast<float>(total_tokens);
+        }
+    }
+
+    // Add to rep_hgraph_ (serialized by HGraph's internal mutex)
+    auto new_ds = Dataset::Make();
+    new_ds->Dim(common_param_.dim_)
+        ->NumElements(1)
+        ->FloatVectors(new_center.data())
+        ->Owner(false);
+    rep_hgraph_->Add(new_ds);
+
+    // 6. Update token_to_dist_ for moved tokens (recompute distance to new center)
+    for (uint64_t rank = task.half; rank < task.tokens.size(); ++rank) {
+        InnerIdType tid = task.tokens[rank];
+        InnerIdType doc_id = token_to_doc_[tid];
+        uint32_t offset = token_to_offset_[tid];
+
+        // Get the token vector
+        bool need_release = false;
+        const uint8_t* codes = mv_codes_->GetCodesById(doc_id, need_release);
+        const uint8_t* token_data = codes + sizeof(uint32_t);
+        const uint64_t code_size = mv_codes_->GetQuantizerCodeSize();
+
+        std::vector<float> token_vec(common_param_.dim_);
+        // Assume FP32 for now
+        std::memcpy(token_vec.data(),
+                    token_data + static_cast<uint64_t>(offset) * code_size,
+                    static_cast<uint64_t>(common_param_.dim_) * sizeof(float));
+
+        if (need_release) {
+            mv_codes_->ReleaseCodes(doc_id, codes);
+        }
+
+        // Compute distance to new center (IP distance = 1 - dot product)
+        float dot = 0.0F;
+        for (int64_t d = 0; d < common_param_.dim_; ++d) {
+            dot += token_vec[d] * new_center[d];
+        }
+        token_to_dist_[tid] = 1.0F - dot;
     }
 }
 
