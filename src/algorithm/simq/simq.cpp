@@ -42,6 +42,10 @@
 
 namespace vsag {
 
+// Forward declaration
+static void
+wait_all_futures(std::vector<std::future<void>>& futures);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal clustering helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,9 +272,7 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
 
     // Batch parallel token assignment
     const int64_t batch_size = 10000;  // Process 10k tokens per batch
-    const int64_t num_threads = static_cast<int64_t>(common_param_.thread_pool_
-        ? common_param_.thread_pool_->GetPoolSize()
-        : 1);
+    const int64_t num_threads = static_cast<int64_t>(this->build_thread_count_);
 
     auto remaining_it = all_indices.begin() + num_init;
 
