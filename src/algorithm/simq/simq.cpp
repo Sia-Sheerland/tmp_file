@@ -1359,6 +1359,8 @@ SIMQ::CheckAndMappingExternalParam(const JsonType& external_param,
         {"coarse_k", {"coarse_k"}},
         {"rerank_k", {"rerank_k"}},
         {"quantization_type", {"quantization_type"}},
+        {BUILD_THREAD_COUNT_KEY, {BUILD_THREAD_COUNT_KEY}},
+        {"split_delay_seconds", {"split_delay_seconds"}},
     };
 
     if (common_param.data_type_ != DataTypes::DATA_TYPE_FLOAT) {
