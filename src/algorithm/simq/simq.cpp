@@ -505,9 +505,12 @@ SIMQ::run_clustering(const float* flat_vecs,
                      const Vector<InnerIdType>& vec_to_doc,
                      int64_t num_vecs,
                      int64_t dim) {
+    std::cerr << "[DEBUG] run_clustering: start, num_vecs=" << num_vecs << ", dim=" << dim << "\n";
     HGraphDynamicClustering clustering(
         init_cluster_ratio_, max_cluster_size_, split_start_idx_, random_seed_, build_thread_count_, common_param_, this->thread_pool_);
+    std::cerr << "[DEBUG] run_clustering: clustering created\n";
     clustering.Fit(flat_vecs, num_vecs, dim);
+    std::cerr << "[DEBUG] run_clustering: Fit() completed\n";
 
     auto nc = static_cast<int64_t>(clustering.cluster_centers_.size());
     num_clusters_ = nc;
@@ -564,27 +567,33 @@ SIMQ::build_rep_hgraph(const float* flat_vecs, int64_t dim) {
 
     if (this->thread_pool_ && num_tokens > 1000) {
         // Parallel path: partition tokens across threads
+        // Each thread collects tokens into its own local buffers
+        std::vector<std::vector<std::vector<int>>> per_thread_members(num_threads);
         std::vector<std::future<void>> futures;
+
         for (int64_t t = 0; t < num_threads; ++t) {
             const int64_t start = t * chunk_size;
             const int64_t end = std::min(start + chunk_size, num_tokens);
             if (start >= num_tokens) break;
 
             futures.push_back(this->thread_pool_->GeneralEnqueue([&, t, start, end]() {
-                // Per-thread local buffers to avoid contention
-                std::vector<std::vector<int>> local_members(static_cast<uint64_t>(num_clusters_));
+                // Per-thread local buffers
+                per_thread_members[t].resize(static_cast<uint64_t>(num_clusters_));
                 for (int64_t v = start; v < end; ++v) {
-                    local_members[vec_to_cluster_[v]].push_back(static_cast<int>(v));
-                }
-                // Merge local buffers into global (sequential but fast)
-                for (int64_t c = 0; c < num_clusters_; ++c) {
-                    auto& global = cluster_token_members[static_cast<uint64_t>(c)];
-                    auto& local = local_members[static_cast<uint64_t>(c)];
-                    global.insert(global.end(), local.begin(), local.end());
+                    per_thread_members[t][vec_to_cluster_[v]].push_back(static_cast<int>(v));
                 }
             }));
         }
         wait_all_futures(futures);
+
+        // Sequential merge: combine all per-thread buffers into global
+        for (int64_t t = 0; t < num_threads; ++t) {
+            for (int64_t c = 0; c < num_clusters_; ++c) {
+                auto& global = cluster_token_members[static_cast<uint64_t>(c)];
+                auto& local = per_thread_members[t][static_cast<uint64_t>(c)];
+                global.insert(global.end(), local.begin(), local.end());
+            }
+        }
     } else {
         // Serial fallback
         for (int64_t v = 0; v < num_tokens; ++v) {
