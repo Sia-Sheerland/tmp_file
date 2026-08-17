@@ -186,10 +186,37 @@ HGraphDynamicClustering::build_hgraph(const std::vector<int>& center_ids, int64_
 
 int
 HGraphDynamicClustering::find_nearest_cluster(int vec_id) const {
+    if (vec_id < 0 || vec_id >= num_vecs_) {
+        // Invalid vec_id, return first cluster as fallback
+        return cluster_centers_.empty() ? 0 : cluster_centers_[0];
+    }
+
     auto query_ds = Dataset::Make();
     query_ds->NumElements(1)->Dim(dim_)->Float32Vectors(vecs_ + vec_id * dim_)->Owner(false);
     auto result = hgraph_->KnnSearch(query_ds, 1, R"({"hgraph": {"ef_search": 100}})", nullptr);
-    return static_cast<int>(result->GetIds()[0]);
+
+    if (!result || result->GetIds() == nullptr || result->GetDim() == 0) {
+        // KnnSearch failed, return first cluster as fallback
+        return cluster_centers_.empty() ? 0 : cluster_centers_[0];
+    }
+
+    int nearest_id = static_cast<int>(result->GetIds()[0]);
+
+    // Verify the returned ID is a valid cluster center
+    bool found = false;
+    for (int cid : cluster_centers_) {
+        if (cid == nearest_id) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        // Invalid cluster ID returned, return first cluster as fallback
+        return cluster_centers_.empty() ? 0 : cluster_centers_[0];
+    }
+
+    return nearest_id;
 }
 
 float
@@ -218,16 +245,26 @@ void
 HGraphDynamicClustering::split_cluster(int old_center_id, int64_t /*dim*/) {
     auto it = clusters_.find(old_center_id);
     if (it == clusters_.end()) {
+        std::cerr << "[DEBUG] split_cluster: cluster " << old_center_id << " not found\n";
         return;  // Cluster not found
     }
     auto& cluster = it->second;
 
     // Safety check: ensure cluster has enough elements to split
     if (cluster.empty() || static_cast<int>(cluster.size()) < split_start_idx_) {
+        std::cerr << "[DEBUG] split_cluster: cluster " << old_center_id
+                  << " size " << cluster.size() << " < split_start_idx " << split_start_idx_ << "\n";
         return;  // Not enough elements to split
     }
 
     int new_center_id = static_cast<int>(cluster.back().vec_id);
+
+    // Verify new_center_id is valid
+    if (new_center_id < 0 || new_center_id >= num_vecs_) {
+        std::cerr << "[DEBUG] split_cluster: invalid new_center_id " << new_center_id
+                  << " (num_vecs=" << num_vecs_ << ")\n";
+        return;
+    }
 
     auto split_it = cluster.begin() + (split_start_idx_ - 1);
     std::vector<cluster_member_entry> to_move(split_it, cluster.end());
@@ -341,9 +378,15 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
         for (const auto& [vid, nearest] : batch_assignments) {
             // Safety checks
             if (vid < 0 || vid >= num_vecs_) {
+                std::cerr << "[DEBUG] Invalid vid: " << vid << " (num_vecs=" << num_vecs_ << ")\n";
                 continue;  // Invalid vector ID
             }
+            if (nearest < 0 || nearest >= num_vecs_) {
+                std::cerr << "[DEBUG] Invalid nearest: " << nearest << " (num_vecs=" << num_vecs_ << ")\n";
+                continue;  // Invalid cluster ID
+            }
             if (clusters_.find(nearest) == clusters_.end()) {
+                std::cerr << "[DEBUG] Cluster not found: " << nearest << "\n";
                 continue;  // Invalid cluster ID
             }
 
