@@ -30,6 +30,7 @@
 
 #include "dataset_impl.h"
 #include "impl/logger/logger.h"
+#include "impl/thread_pool/safe_thread_pool.h"
 #include "index_feature_list.h"
 #include "inner_string_params.h"
 #include "metric_type.h"
@@ -108,13 +109,15 @@ public:
                             int64_t split_start_idx,
                             int64_t random_seed,
                             int64_t build_thread_count,
-                            IndexCommonParam common_param)
+                            IndexCommonParam common_param,
+                            std::shared_ptr<SafeThreadPool> thread_pool)
         : init_cluster_ratio_(init_cluster_ratio),
           max_cluster_size_(static_cast<int>(max_cluster_size)),
           split_start_idx_(static_cast<int>(split_start_idx)),
           random_seed_(static_cast<int>(random_seed)),
           build_thread_count_(build_thread_count),
-          common_param_(std::move(common_param)) {
+          common_param_(std::move(common_param)),
+          thread_pool_(std::move(thread_pool)) {
     }
 
     ~HGraphDynamicClustering() = default;
@@ -148,6 +151,7 @@ private:
     int random_seed_;
     int64_t build_thread_count_;
     IndexCommonParam common_param_;
+    std::shared_ptr<SafeThreadPool> thread_pool_;
 
     const float* vecs_{nullptr};
     int64_t num_vecs_{0};
@@ -293,7 +297,7 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
         // Parallel phase: find nearest cluster for all tokens in batch
         std::vector<std::pair<int, int>> batch_assignments(count);  // (vid, nearest_cid)
 
-        if (num_threads > 1 && count > 100) {
+        if (num_threads > 1 && count > 100 && thread_pool_) {
             std::vector<std::future<void>> futures;
             const int64_t chunk_size = (count + num_threads - 1) / num_threads;
 
@@ -302,7 +306,7 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
                 const int64_t end = std::min(start + chunk_size, count);
                 if (start >= count) break;
 
-                futures.push_back(common_param_.thread_pool_->GeneralEnqueue(
+                futures.push_back(thread_pool_->GeneralEnqueue(
                     [&, t, start, end]() {
                         for (int64_t i = start; i < end; ++i) {
                             int vid = *(remaining_it + i);
@@ -442,7 +446,7 @@ SIMQ::run_clustering(const float* flat_vecs,
                      int64_t num_vecs,
                      int64_t dim) {
     HGraphDynamicClustering clustering(
-        init_cluster_ratio_, max_cluster_size_, split_start_idx_, random_seed_, build_thread_count_, common_param_);
+        init_cluster_ratio_, max_cluster_size_, split_start_idx_, random_seed_, build_thread_count_, common_param_, this->thread_pool_);
     clustering.Fit(flat_vecs, num_vecs, dim);
 
     auto nc = static_cast<int64_t>(clustering.cluster_centers_.size());
