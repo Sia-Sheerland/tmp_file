@@ -216,7 +216,16 @@ HGraphDynamicClustering::sorted_insert(std::vector<cluster_member_entry>& member
 
 void
 HGraphDynamicClustering::split_cluster(int old_center_id, int64_t /*dim*/) {
-    auto& cluster = clusters_[old_center_id];
+    auto it = clusters_.find(old_center_id);
+    if (it == clusters_.end()) {
+        return;  // Cluster not found
+    }
+    auto& cluster = it->second;
+
+    // Safety check: ensure cluster has enough elements to split
+    if (cluster.empty() || static_cast<int>(cluster.size()) < split_start_idx_) {
+        return;  // Not enough elements to split
+    }
 
     int new_center_id = static_cast<int>(cluster.back().vec_id);
 
@@ -330,6 +339,14 @@ HGraphDynamicClustering::Fit(const float* vecs, int64_t num_vecs, int64_t dim) {
 
         // Serial phase: apply assignments and check for splits
         for (const auto& [vid, nearest] : batch_assignments) {
+            // Safety checks
+            if (vid < 0 || vid >= num_vecs_) {
+                continue;  // Invalid vector ID
+            }
+            if (clusters_.find(nearest) == clusters_.end()) {
+                continue;  // Invalid cluster ID
+            }
+
             float dist = ip_distance(vid, nearest);
             sorted_insert(clusters_[nearest], static_cast<InnerIdType>(vid), dist);
             vec_to_cluster_[vid] = nearest;
