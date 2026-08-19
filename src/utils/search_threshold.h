@@ -38,9 +38,6 @@ ParseSearchThreshold(const std::string& parameters) {
     if (not json.Contains(SEARCH_THRESHOLD)) {
         return std::nullopt;
     }
-    CHECK_ARGUMENT(
-        json[SEARCH_THRESHOLD].GetInnerJson()->is_number(),
-        "search threshold must be a number");
     const auto threshold = json[SEARCH_THRESHOLD].GetFloat();
     CHECK_ARGUMENT(std::isfinite(threshold), "search threshold must be finite");
     return threshold;
