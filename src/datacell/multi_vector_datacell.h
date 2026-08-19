@@ -86,13 +86,13 @@ public:
     [[nodiscard]] std::string
     GetQuantizerName() override;
 
-    [[nodiscard]] MetricType
-    GetMetricType() override;
-
     [[nodiscard]] uint64_t
     GetQuantizerCodeSize() const override {
         return this->quantizer_->GetCodeSize();
     }
+
+    [[nodiscard]] MetricType
+    GetMetricType() override;
 
     [[nodiscard]] const uint8_t*
     GetCodesById(InnerIdType id, bool& need_release) const override;

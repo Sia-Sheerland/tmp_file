@@ -36,6 +36,8 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::MultiVectorDataCell(
       multi_vector_dim_(static_cast<uint32_t>(common_param.dim_)),
       metric_(common_param.metric_) {
     this->quantizer_ = std::make_shared<QuantTmpl>(quantization_param, common_param);
+    this->backend_ =
+        QuantizerDistanceBackend<QuantTmpl>::Get(static_cast<const QuantTmpl&>(*this->quantizer_));
     this->io_ = std::make_shared<IOTmpl>(io_param, common_param);
     this->offset_io_ =
         std::make_shared<MemoryBlockIO>(Options::Instance().block_size_limit(), allocator_);
@@ -69,8 +71,7 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::InsertVector(const void* vector, InnerId
     }
 
     const uint64_t code_size_per_token = this->quantizer_->GetCodeSize();
-    const uint64_t payload_bytes =
-        static_cast<uint64_t>(multi_vector->len_) * code_size_per_token;
+    const uint64_t payload_bytes = static_cast<uint64_t>(multi_vector->len_) * code_size_per_token;
     const uint64_t code_size = sizeof(uint32_t) + payload_bytes;
     ByteBuffer codes(code_size, allocator_);
     std::memcpy(codes.data, &multi_vector->len_, sizeof(uint32_t));
@@ -80,9 +81,9 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::InsertVector(const void* vector, InnerId
         const float* token_vec =
             multi_vector->vectors_ +
             static_cast<uint64_t>(t) * static_cast<uint64_t>(multi_vector_dim_);
-        this->quantizer_->EncodeOne(token_vec,
-                                    codes.data + sizeof(uint32_t) +
-                                        static_cast<uint64_t>(t) * code_size_per_token);
+        this->quantizer_->EncodeOne(
+            token_vec,
+            codes.data + sizeof(uint32_t) + static_cast<uint64_t>(t) * code_size_per_token);
     }
 
     uint64_t old_offset = 0;
@@ -159,8 +160,7 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::GetCodesById(InnerIdType id, bool& need_
     uint32_t len = 0;
     io_->Read(sizeof(len), offset, (uint8_t*)&len);
     const uint64_t code_size_per_token = this->quantizer_->GetCodeSize();
-    uint64_t read_size =
-        sizeof(uint32_t) + static_cast<uint64_t>(len) * code_size_per_token;
+    uint64_t read_size = sizeof(uint32_t) + static_cast<uint64_t>(len) * code_size_per_token;
     auto* codes = static_cast<uint8_t*>(allocator_->Allocate(read_size));
     io_->Read(read_size, offset, codes);
     need_release = true;
@@ -199,6 +199,8 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Deserialize(lvalue_or_rvalue<StreamReade
     this->offset_io_->Deserialize(reader);
     this->io_->Deserialize(reader);
     this->quantizer_->Deserialize(reader);
+    this->backend_ =
+        QuantizerDistanceBackend<QuantTmpl>::Get(static_cast<const QuantTmpl&>(*this->quantizer_));
 
     // Rebuild token_counts_ cache using batched MultiRead so Query does not need
     // a separate io_submit to fetch token counts from disk.
@@ -216,8 +218,7 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Deserialize(lvalue_or_rvalue<StreamReade
                               static_cast<uint64_t>(this->total_count_));
 
         token_counts_.resize(static_cast<uint64_t>(this->total_count_));
-        std::vector<uint64_t> tc_sizes(static_cast<uint64_t>(this->total_count_),
-                                       sizeof(uint32_t));
+        std::vector<uint64_t> tc_sizes(static_cast<uint64_t>(this->total_count_), sizeof(uint32_t));
         this->io_->MultiRead(reinterpret_cast<uint8_t*>(token_counts_.data()),
                              tc_sizes.data(),
                              offsets.data(),
@@ -274,12 +275,11 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
     uint64_t total_size = 0;
     for (InnerIdType i = 0; i < id_count; ++i) {
         const uint32_t token_count = token_counts_[idx[i]];
-        data_sizes[i] = sizeof(uint32_t) +
-                        static_cast<uint64_t>(token_count) * code_size_per_token;
+        data_sizes[i] = sizeof(uint32_t) + static_cast<uint64_t>(token_count) * code_size_per_token;
         total_size += data_sizes[i];
     }
 
-    // Step 2.5: Sort requests by disk offset for sequential IO (lever 3).
+    // Step 2.5: Sort requests by disk offset for sequential IO.
     //           SSD schedulers handle sorted requests more efficiently, and
     //           AsyncIO::MultiReadImpl can merge/schedule them better.
     //           We build a permutation, reorder offsets/data_sizes accordingly,
@@ -305,8 +305,9 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
                          sorted_data_sizes.data(),
                          sorted_offsets.data(),
                          static_cast<uint64_t>(id_count));
-    double io_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_io_start).count();
+    double io_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_io_start)
+            .count();
 
     // Step 4: Compute MaxSim distances in sorted order → temp_dists
     auto t_compute_start = std::chrono::steady_clock::now();
@@ -329,20 +330,18 @@ MultiVectorDataCell<QuantTmpl, IOTmpl>::Query(float* result_dists,
                 decoded_tokens.data() +
                     static_cast<uint64_t>(t) * static_cast<uint64_t>(multi_vector_dim_));
         }
-        mv_computer->ComputeDist(reinterpret_cast<const uint8_t*>(decoded_tokens.data()),
-                                 token_count,
-                                 &temp_dists[i]);
+        mv_computer->ComputeDist(
+            reinterpret_cast<const uint8_t*>(decoded_tokens.data()), token_count, &temp_dists[i]);
         cursor += sorted_data_sizes[i];
     }
 
     // Step 4.5: Unsort temp_dists back to the caller's original order.
-    //           result_dists[perm[i]] = temp_dists[i] places each distance
-    //           at the position matching the caller's idx[] array.
     for (InnerIdType i = 0; i < id_count; ++i) {
         result_dists[perm[i]] = temp_dists[i];
     }
-    double compute_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_compute_start).count();
+    double compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  t_compute_start)
+                            .count();
 
     this->allocator_->Deallocate(all_codes);
 
