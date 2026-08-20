@@ -45,8 +45,8 @@ public:
 
     bool
     Decode(const uint8_t* codes, float* vector) override {
-        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
-                            "Decode is not supported for MultiVectorDataCell");
+        this->quantizer_->DecodeOne(codes, vector);
+        return true;
     }
 
     bool
@@ -86,13 +86,13 @@ public:
     [[nodiscard]] std::string
     GetQuantizerName() override;
 
-    [[nodiscard]] MetricType
-    GetMetricType() override;
-
     [[nodiscard]] uint64_t
     GetQuantizerCodeSize() const override {
         return this->quantizer_->GetCodeSize();
     }
+
+    [[nodiscard]] MetricType
+    GetMetricType() override;
 
     [[nodiscard]] const uint8_t*
     GetCodesById(InnerIdType id, bool& need_release) const override;
