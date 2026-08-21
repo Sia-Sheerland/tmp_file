@@ -1,0 +1,13 @@
+# 在 Mac 终端运行(用你平时 ssh 的别名 f63)
+
+# 下载单个
+scp f63:/home/lyf525927/multivector_experiment_p3/vector_test/cpp/SIMQ_try_3.cpp /Users/siasheerland/Downloads/
+
+# 一次性下载多个
+scp f63:/home/lyf525927/multivector_experiment_p3/vector_test/cpp/SIMQ_try_3.cpp \
+    f63:/home/lyf525927/multivector_experiment_p3/vector_test/cpp/SIMQ_try_4.cpp \
+    f63:/home/lyf525927/multivector_experiment_p3/vector_test/cpp/cluster_eval_disk_v4.cpp \
+    /Users/siasheerland/Downloads/
+
+# 验证
+ls -lh /Users/siasheerland/Downloads/SIMQ_try_*.cpp /Users/siasheerland/Downloads/cluster_eval_disk_v4.cpp

@@ -75,6 +75,13 @@ public:
 
 public:
     /// Default number of concurrent AIO requests supported.
+    /// Tuning notes (2026-07-27): increasing from 400 to 4096 did NOT improve
+    /// throughput on the target workload (2322-doc rerank batches). The
+    /// bottleneck is actual NVMe IO time (~40-50ms) plus CPU overhead from
+    /// per-request posix_memalign/memcpy/free (~10ms). Larger batches hurt
+    /// slightly due to tail latency — with 2322 concurrent IOs, the slowest
+    /// one is slower than the slowest of 400 (extreme-value statistics).
+    /// 400 remains the sweet spot for this workload.
     static constexpr int64_t DEFAULT_REQUEST_COUNT = 400;
 
     /// The libaio context handle.

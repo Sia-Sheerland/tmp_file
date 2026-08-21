@@ -38,7 +38,9 @@ AsyncIO::AsyncIO(std::string filename, Allocator* allocator)
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("{} is a directory", this->filepath_));
     }
-    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
+    // NOTE: removed O_DIRECT to allow reads to go through the page cache.
+    // When data fits in RAM, this gives much higher throughput than O_DIRECT.
+    this->rfd_ = open(filepath_.c_str(), O_CREAT | O_RDWR, 0644);
     if (this->rfd_ < 0) {
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             fmt::format("open file {} error {}", this->filepath_, strerror(errno)));

@@ -134,6 +134,11 @@ public:
     [[nodiscard]] virtual MetricType
     GetMetricType() = 0;
 
+    [[nodiscard]] virtual uint64_t
+    GetQuantizerCodeSize() const {
+        return this->code_size_;
+    }
+
     virtual void
     Resize(InnerIdType capacity) = 0;
 

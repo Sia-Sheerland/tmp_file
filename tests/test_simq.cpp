@@ -104,7 +104,7 @@ make_build_param(const std::string& mv_file_path,
             "metric_type": "ip",
             "dim": {},
             "index_param": {{
-                "base_io_type": "async_io",
+                "base_io_type": "memory_io",
                 "base_file_path": "{}",
                 "init_cluster_ratio": {},
                 "max_cluster_size": {},

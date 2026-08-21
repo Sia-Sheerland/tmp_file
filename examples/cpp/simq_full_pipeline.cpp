@@ -157,19 +157,25 @@ static vsag::BinarySet load_binary_set(const std::string& path) {
 }
 
 static std::string make_build_param(const std::string& mv_file_path,
-                                    int64_t rerank_k_default) {
+                                    int64_t rerank_k_default,
+                                    int64_t build_thread_count = 1,
+                                    double split_delay_seconds = 0.0,
+                                    const std::string& quantization_type = "fp32") {
     return "{"
            "\"dtype\":\"float32\","
            "\"metric_type\":\"ip\","
            "\"dim\":256,"
            "\"index_param\":{"
-           "\"base_io_type\":\"async_io\","
+           "\"base_io_type\":\"memory_io\","
            "\"base_file_path\":\"" + mv_file_path + "\","
            "\"init_cluster_ratio\":0.1,"
            "\"max_cluster_size\":160,"
            "\"split_start_idx\":80,"
            "\"coarse_k\":50,"
-           "\"rerank_k\":" + std::to_string(rerank_k_default) +
+           "\"rerank_k\":" + std::to_string(rerank_k_default) + ","
+           "\"build_thread_count\":" + std::to_string(build_thread_count) + ","
+           "\"split_delay_seconds\":" + std::to_string(split_delay_seconds) + ","
+           "\"quantization_type\":\"" + quantization_type + "\""
            "}}";
 }
 
@@ -181,18 +187,25 @@ static std::string make_search_param(int coarse_k, int64_t rerank_k) {
 int main(int argc, char** argv) {
     std::string h5_path = "/dataset/multi_vec_20260513.hdf5";
     int64_t base_docs = 1000000;
-    std::string mode = "auto";  // auto | rebuild | load
+    std::string mode = "auto";           // auto | rebuild | load
+    int64_t build_threads = 1;           // parallel build thread count
+    double split_delay = 0.0;            // seconds to wait before split (0 = immediate)
+    std::string quant_type = "fp32";     // fp32 | fp16 | bf16 | sq8_uniform | int8
 
     const int dim = 256;
     const int search_topk = 100;
 
-    const std::string index_file = "/tmp/simq_index.bin";
-    const std::string mv_file = "/tmp/simq_mv_codes.bin";
-    const std::string out_txt = "/tmp/simq_eval.txt";
-
     if (argc >= 2) h5_path = argv[1];
     if (argc >= 3) base_docs = std::atoll(argv[2]);
     if (argc >= 4) mode = argv[3];
+    if (argc >= 5) build_threads = std::atoll(argv[4]);
+    if (argc >= 6) split_delay = std::atof(argv[5]);
+    if (argc >= 7) quant_type = argv[6];
+
+    // 文件名带量化类型后缀，方便保留多个索引
+    const std::string index_file = "/tmp/simq_index_" + quant_type + ".bin";
+    const std::string mv_file = "/tmp/simq_mv_codes_" + quant_type + ".bin";
+    const std::string out_txt = "/tmp/simq_eval_" + quant_type + ".txt";
 
     hid_t f = H5Fopen(h5_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     if (f < 0) throw std::runtime_error("failed to open hdf5: " + h5_path);
@@ -214,8 +227,9 @@ int main(int argc, char** argv) {
     auto test = read_f32_2d(
         f, "test", 0, static_cast<hsize_t>(qtokens), static_cast<hsize_t>(dim));
 
-    int64_t rerank_full = base_docs;
-    std::string build_param = make_build_param(mv_file, rerank_full);
+    int64_t rerank_k = 1000;  // 候选文档数固定为 1000
+    std::string build_param =
+        make_build_param(mv_file, rerank_k, build_threads, split_delay, quant_type);
 
     bool need_build = (mode == "rebuild") || (!file_exists(index_file));
     if (mode == "load") need_build = false;
@@ -313,19 +327,37 @@ int main(int argc, char** argv) {
         qv[static_cast<size_t>(i)].vectors_ = test.data() + test_offsets[i] * dim;
     }
 
-    std::vector<int> sweep = {300, 600, 900, 1500, 2400, 3600, 4000};
+    // Sweep coarse_k (= HNSW m in try_3 reference): probes per query token
+    //   2 (min)
+    //   5,10,...,50  step 5
+    //   60,70,...,100  step 10
+    //   150,200,...,1000  step 50
+    //   1250,1500,...,3000  step 250
+    std::vector<int> sweep;
+    sweep.push_back(2);
+    for (int v = 5; v <= 50; v += 5) sweep.push_back(v);
+    for (int v = 60; v <= 100; v += 10) sweep.push_back(v);
+    for (int v = 150; v <= 1000; v += 50) sweep.push_back(v);
+    for (int v = 1250; v <= 3000; v += 250) sweep.push_back(v);
 
     std::vector<int> eval_ks = {10, 20, 50, 100};
 
     std::ofstream log(out_txt);
-    log << "coarse_k,avg_ms,qps,avg_nret,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
+    log << "coarse_k,avg_ms,qps,avg_nret,avg_coarse_ms,avg_query_ms,avg_sort_ms,avg_mv_io_ms,avg_mv_compute_ms,avg_mv_candidates,avg_iops,avg_bw_mb_s,recall_10_at_10,recall_20_at_20,recall_50_at_50,recall_100_at_100\n";
 
     for (int ck : sweep) {
-        std::string search_param = make_search_param(ck, rerank_full);
+        std::string search_param = make_search_param(ck, rerank_k);
 
         double total_s = 0.0;
         std::vector<double> recall_sum(eval_ks.size(), 0.0);
         double nret_sum = 0.0;
+        double coarse_ms_sum = 0.0;
+        double query_ms_sum = 0.0;
+        double sort_ms_sum = 0.0;
+        double mv_io_ms_sum = 0.0;
+        double mv_compute_ms_sum = 0.0;
+        double mv_candidates_sum = 0.0;
+        double mv_io_bytes_sum = 0.0;
 
         for (int64_t qi = 0; qi < qnum; ++qi) {
             auto ds = vsag::Dataset::Make();
@@ -349,6 +381,24 @@ int main(int argc, char** argv) {
             int64_t nret = result->GetDim();  // KNN result dim = topK; num_elements = query count
             nret_sum += static_cast<double>(nret);
 
+            // Read per-phase timings from statistics JSON
+            auto timing_vals = result->GetStatistics({"simq_coarse_ms",
+                                                      "simq_query_ms",
+                                                      "simq_sort_ms",
+                                                      "simq_mv_io_ms",
+                                                      "simq_mv_compute_ms",
+                                                      "simq_mv_candidates",
+                                                      "mv_io_bytes"});
+            if (timing_vals.size() == 7) {
+                if (!timing_vals[0].empty()) coarse_ms_sum += std::stod(timing_vals[0]);
+                if (!timing_vals[1].empty()) query_ms_sum += std::stod(timing_vals[1]);
+                if (!timing_vals[2].empty()) sort_ms_sum += std::stod(timing_vals[2]);
+                if (!timing_vals[3].empty()) mv_io_ms_sum += std::stod(timing_vals[3]);
+                if (!timing_vals[4].empty()) mv_compute_ms_sum += std::stod(timing_vals[4]);
+                if (!timing_vals[5].empty()) mv_candidates_sum += std::stod(timing_vals[5]);
+                if (!timing_vals[6].empty()) mv_io_bytes_sum += std::stod(timing_vals[6]);
+            }
+
             for (size_t ei = 0; ei < eval_ks.size(); ++ei) {
                 int k = eval_ks[ei];
 
@@ -370,11 +420,31 @@ int main(int argc, char** argv) {
 
         double avg_ms = total_s * 1000.0 / static_cast<double>(qnum);
         double qps = static_cast<double>(qnum) / total_s;
+        double avg_coarse_ms = coarse_ms_sum / qnum;
+        double avg_query_ms = query_ms_sum / qnum;
+        double avg_sort_ms = sort_ms_sum / qnum;
+        double avg_mv_io_ms = mv_io_ms_sum / qnum;
+        double avg_mv_compute_ms = mv_compute_ms_sum / qnum;
+        double avg_mv_candidates = mv_candidates_sum / qnum;
+        double avg_iops = (mv_io_ms_sum > 0.0)
+                              ? mv_candidates_sum / (mv_io_ms_sum / 1000.0)
+                              : 0.0;
+        double avg_bw_mb_s = (mv_io_ms_sum > 0.0)
+                                 ? mv_io_bytes_sum / (mv_io_ms_sum / 1000.0) / 1e6
+                                 : 0.0;
 
         std::cout << "coarse=" << ck
                   << " avg_ms=" << avg_ms
                   << " qps=" << qps
                   << " avg_nret=" << nret_sum / qnum
+                  << " coarse=" << avg_coarse_ms << "ms"
+                  << " query=" << avg_query_ms << "ms"
+                  << " sort=" << avg_sort_ms << "ms"
+                  << " mv_io=" << avg_mv_io_ms << "ms"
+                  << " mv_compute=" << avg_mv_compute_ms << "ms"
+                  << " mv_cands=" << avg_mv_candidates
+                  << " iops=" << avg_iops
+                  << " bw_mb_s=" << avg_bw_mb_s
                   << " r10=" << recall_sum[0] / qnum
                   << " r20=" << recall_sum[1] / qnum
                   << " r50=" << recall_sum[2] / qnum
@@ -385,6 +455,14 @@ int main(int argc, char** argv) {
             << avg_ms << ","
             << qps << ","
             << nret_sum / qnum << ","
+            << avg_coarse_ms << ","
+            << avg_query_ms << ","
+            << avg_sort_ms << ","
+            << avg_mv_io_ms << ","
+            << avg_mv_compute_ms << ","
+            << avg_mv_candidates << ","
+            << avg_iops << ","
+            << avg_bw_mb_s << ","
             << recall_sum[0] / qnum << ","
             << recall_sum[1] / qnum << ","
             << recall_sum[2] / qnum << ","

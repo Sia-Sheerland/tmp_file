@@ -1,0 +1,13 @@
+apt install fio -y 2>&1 | tail -3
+
+which fio
+
+fio --name=rand_tmp --ioengine=libaio --iodepth=400 --rw=randread --bs=34k --direct=1 --size=34G --numjobs=1 --runtime=10 --filename=/tmp/simq_mv_codes.bin 2>&1 | tee /tmp/fio_tmp.log
+
+fio --name=rand_ds --ioengine=libaio --iodepth=400 --rw=randread --bs=34k --direct=1 --size=34G --numjobs=1 --runtime=10 --filename=/dataset/simq_mv_codes.bin 2>&1 | tee /tmp/fio_dataset.log
+
+echo "--- /tmp (overlay) ---"
+grep -E "IOPS|BW" /tmp/fio_tmp.log | head -5
+
+echo "--- /dataset (NVMe direct) ---"
+grep -E "IOPS|BW" /tmp/fio_dataset.log | head -5
